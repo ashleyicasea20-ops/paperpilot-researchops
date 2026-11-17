@@ -1,11 +1,12 @@
 # PaperPilot ResearchOps
 
-PaperPilot ResearchOps 是面向 AI 科研工作流与实验智能管理的全栈平台。本仓库的第一阶段提供可运行的 Next.js 前端、FastAPI 后端、真实 HTTP 健康检查以及基础自动化测试。
+PaperPilot ResearchOps 是面向 AI 科研工作流与实验智能管理的全栈平台。当前 Stage 02A 在已有 Next.js 与 FastAPI 基础上增加了 PostgreSQL 连接和数据库就绪检查。
 
 ## 技术栈
 
 - Frontend: Next.js 16, React 19, TypeScript, Tailwind CSS 4, App Router
-- Backend: Python 3.11, FastAPI, Uvicorn
+- Backend: Python 3.11, FastAPI, Uvicorn, SQLAlchemy 2.x, Psycopg 3
+- Database: PostgreSQL 17
 - Testing: pytest, HTTPX / FastAPI TestClient
 
 ## 环境准备（Windows PowerShell）
@@ -15,6 +16,7 @@ PaperPilot ResearchOps 是面向 AI 科研工作流与实验智能管理的全�
 - Python 3.11（可通过 `py -3.11` 调用）
 - Node.js 24 与 npm 11
 - Git
+- PostgreSQL 17（本机程序目录为 `D:\pgsql`，数据目录为 `D:\PostgreSQL\data\17`）
 
 首次准备后端：
 
@@ -26,6 +28,26 @@ python -m pip install -r requirements.txt
 ```
 
 如果 PowerShell 阻止激活脚本，可以不激活环境，直接使用 `.\.venv\Scripts\python.exe` 执行后端命令。
+
+### PostgreSQL 与后端配置
+
+检查 PostgreSQL 状态并启动本地 ZIP 版本：
+
+```powershell
+& "D:\pgsql\bin\pg_ctl.exe" status -D "D:\PostgreSQL\data\17"
+& "D:\pgsql\bin\pg_ctl.exe" start -D "D:\PostgreSQL\data\17" -l "D:\PostgreSQL\data\17\postgresql.log"
+& "D:\pgsql\bin\pg_isready.exe" -h 127.0.0.1 -p 5432 -d paperpilot_dev
+```
+
+首次配置后端时复制安全模板，并只在本机文件中填写真实密码：
+
+```powershell
+Set-Location backend
+Copy-Item .env.example .env
+# 使用编辑器填写 backend/.env 中的 DB_PASSWORD；不要把密码写入终端历史或提交到 Git。
+```
+
+`backend/.env` 使用 `DB_HOST`、`DB_PORT`、`DB_NAME`、`DB_USER` 和 `DB_PASSWORD`。程序通过 Pydantic Settings 加载配置，并使用 SQLAlchemy `URL.create` 构建连接 URL。根目录 `.gitignore` 已忽略真实 `.env` 文件。
 
 首次准备前端：
 
@@ -48,7 +70,15 @@ $env:CORS_ORIGINS = "http://localhost:3000"
 python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-健康检查地址：<http://localhost:8000/api/v1/health>
+API 检查：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/health
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/ready
+```
+
+- `/api/v1/health` 是进程健康检查，不访问数据库。
+- `/api/v1/ready` 连接 PostgreSQL 并执行 `SELECT 1`；成功返回 HTTP 200，配置缺失或数据库不可用时返回 HTTP 503。
 
 ## 启动前端
 
@@ -70,7 +100,11 @@ npm run dev
 Set-Location backend
 .\.venv\Scripts\Activate.ps1
 python -m pytest -q
+python -m pytest -q -m integration
+python -m pip check
 ```
+
+`integration` 标记的测试读取本机 `backend/.env` 并连接真实 PostgreSQL；缺少该文件时会明确跳过，不能用 Mock 结果替代。
 
 前端检查：
 
@@ -89,10 +123,16 @@ paperpilot-researchops/
 │   ├── .venv/                 # 本地虚拟环境，不提交
 │   ├── app/
 │   │   ├── __init__.py
+│   │   ├── core/config.py
+│   │   ├── db/session.py
 │   │   └── main.py
 │   ├── tests/
 │   │   ├── __init__.py
-│   │   └── test_health.py
+│   │   ├── test_config.py
+│   │   ├── test_database_integration.py
+│   │   ├── test_health.py
+│   │   └── test_readiness.py
+│   ├── pytest.ini
 │   └── requirements.txt
 ├── docs/
 │   └── architecture.md
@@ -112,13 +152,34 @@ paperpilot-researchops/
 
 架构边界与后续扩展原则见 [`docs/architecture.md`](docs/architecture.md)。
 
+## 常见数据库错误
+
+- `connection refused`：用 `pg_ctl status` 和 `pg_isready` 确认 PostgreSQL 已启动并监听 `127.0.0.1:5432`。
+- `password authentication failed`：核对 `backend/.env` 中的用户和密码；不要把密码粘贴到日志、Issue 或聊天中。
+- `/ready` 返回 503：先检查 `DB_PASSWORD` 是否已配置，再检查数据库 `paperpilot_dev` 与用户 `paperpilot_app` 是否存在并可登录。
+- 连接超时：检查端口、防火墙和 `postgresql.conf` / `pg_hba.conf`。应用连接超时为 5 秒。
+
 ## 当前阶段边界
 
-第一阶段不包含 Docker、数据库、缓存、云部署、研究 Agent 编排或大模型 API。所有这些能力将在出现明确需求和数据边界后再选型。
+Stage 02A 只建立数据库配置、连接池、Session 生命周期和只读就绪查询，不创建业务表，也不引入 Alembic、Docker、Redis、云部署、研究 Agent 编排或大模型 API。
 
 ## 本地验证记录
 
-验证日期：2026-11-16（Windows PowerShell）
+Stage 02A 验证日期：2026-11-17（Windows PowerShell）。
+
+| 检查项 | 实际结果 |
+| --- | --- |
+| Python 虚拟环境 | Python 3.11.6，复用 `backend/.venv` |
+| PostgreSQL | PostgreSQL 17.12，`127.0.0.1:5432` 可连接 |
+| SQLAlchemy `SELECT 1` | 真实数据库返回 `1` |
+| `python -m pytest -q -m integration` | 1 passed，5 deselected |
+| `python -m pytest -q` | 6 passed |
+| `python -m pip check` | `No broken requirements found.` |
+| API 健康检查 | `/api/v1/health` 返回 HTTP 200 |
+| 数据库就绪检查 | `/api/v1/ready` 返回 HTTP 200 和 `{"status":"ok","database":"ready"}` |
+| 凭据保护 | `backend/.env` 被 Git 忽略且未被跟踪；测试和响应未输出凭据 |
+
+Stage 01 基线验证日期：2026-11-16（Windows PowerShell）。
 
 | 检查项 | 实际结果 |
 | --- | --- |
