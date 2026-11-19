@@ -1,8 +1,8 @@
 # PaperPilot ResearchOps Architecture
 
-## Stage 02A scope
+## Stage 02B scope
 
-Stage 02A adds synchronous PostgreSQL connectivity to the existing web UI and API boundary. It introduces configuration, an SQLAlchemy 2.x engine, Psycopg 3, session lifecycle management, and a readiness probe. It does not introduce business tables, migrations, queues, containers, caches, agent frameworks, or model providers.
+Stage 02A established synchronous PostgreSQL connectivity, configuration, session lifecycle management, and a readiness probe. Stage 02B adds the User, Workspace, and WorkspaceMember ORM definitions and offline schema tests. These definitions are not deployed tables: this stage does not create or change PostgreSQL schema. Alembic migrations belong to Stage 02C. Authentication, authorization APIs, queues, containers, caches, agent frameworks, and model providers remain outside this stage.
 
 ## Runtime topology
 
@@ -36,6 +36,8 @@ The homepage is mostly a React Server Component. Only the health-status widget i
 - `backend/app/` owns HTTP APIs and application behavior.
 - `backend/app/core/config.py` validates environment-backed database settings and builds a safe SQLAlchemy URL.
 - `backend/app/db/session.py` owns the synchronous engine, connection pool, session factory, and connectivity check.
+- `backend/app/db/base.py` owns the shared declarative metadata and UUID/timestamp mixins.
+- `backend/app/models/` owns identity, workspace ownership, and collaborator mappings.
 - `backend/tests/` owns API contract and middleware checks.
 - `docs/` records architecture decisions that apply across both runtimes.
 
@@ -76,7 +78,43 @@ Application sessions are request-scoped generators: successful use closes the se
 
 Readiness unit tests mock the connectivity function to exercise HTTP 200 and 503 contracts. A separately marked `integration` test uses `backend/.env` and the real PostgreSQL server; it is skipped with an explicit reason when local credentials are not configured. Mock tests are never reported as real database verification.
 
+Integration failures report only the exception type and a generic diagnostic message. Driver/configuration exceptions are caught before calling `pytest.fail(..., pytrace=False)` outside the exception handler, preventing pytest from expanding credential-bearing driver frames or chained exception context. Unit regressions cover both driver and settings failures. Connection failures remain failures, rather than being silently skipped.
+
+Stage 02B model tests use an isolated `sqlite+pysqlite:///:memory:` engine with `PRAGMA foreign_keys=ON`. Only that fixture creates tables with `Base.metadata.create_all(engine)`; it closes/disposes the in-memory database afterward. No application startup code, model import, or PostgreSQL integration test runs schema DDL. Model tests do not load local credentials. PostgreSQL DDL is compiled offline, including expression indexes and named constraints; the real integration test remains the existing read-only `SELECT 1`.
+
+SQLite exercises basic constraints and ORM cascades, but it is not a PostgreSQL compatibility proof: its default `lower()` only handles ASCII case, `VARCHAR(n)` does not enforce PostgreSQL's length limit, UUIDs are stored as hex text, timezone-aware timestamp storage differs, and transaction/concurrency behavior differs. Native PostgreSQL schema and behavior tests will require a separately approved disposable database in a later stage.
+
+## ORM schema and metadata
+
+All three models use one `Base(DeclarativeBase)` and `Base.metadata`. Import `app.models` before supplying `Base.metadata` as Stage 02C's Alembic `target_metadata`; importing `Base` alone does not discover models. Model imports only register Python mappings and never create an engine or load database settings.
+
+The metadata naming convention generates `pk_<table>`, `fk_<table>_<column>_<target>`, `ck_<table>_<check-name>`, `uq_<table>_<column>`, and `ix_<table>_<column>`. The email expression index has the explicit stable name `uq_users_email_lower`. This makes future migration output reproducible.
+
+| Model / table | Columns (all NOT NULL) | Keys, checks, and secondary indexes |
+| --- | --- | --- |
+| User / `users` | `id Uuid`, `email String(320)`, `password_hash String(255)`, `is_active Boolean`, `created_at` / `updated_at DateTime(timezone=True)` | UUID PK; unique index on `lower(email)`; nonblank email/hash checks; active defaults to true |
+| Workspace / `workspaces` | `id Uuid`, `owner_id Uuid`, `name String(150)`, `created_at` / `updated_at DateTime(timezone=True)` | UUID PK; owner FK to users with RESTRICT; owner index; nonblank name check; names are not unique |
+| WorkspaceMember / `workspace_members` | `workspace_id Uuid`, `user_id Uuid`, `role String(16)`, `joined_at DateTime(timezone=True)` | Composite PK `(workspace_id, user_id)`; workspace/user FKs with CASCADE; user index; role CHECK allows admin/editor/viewer only; default viewer |
+
+`Uuid(as_uuid=True)` maps Python `uuid.UUID` to native PostgreSQL UUID. A shared UUID mixin uses the callable `uuid4`, generating a fresh ID at SQLAlchemy insert time, not when constructing an unsaved object. There is no UUID server default, so direct SQL inserts must supply IDs. WorkspaceMember uses its two FKs as the primary key and has no redundant ID or workspace-only index; the composite primary key already supports workspace-prefix lookups.
+
+The unique email index provides database protection against case variants according to PostgreSQL `lower()` and the database's locale/collation. It does not implement full Unicode case folding, Unicode normalization, whitespace stripping, or email syntax validation. Unicode case behavior may differ across collations and from Python `casefold()`; no universal Unicode-equivalence claim is made. Stage 03 must define and validate the input policy (including strip/lower and internationalized addresses) consistently before writes. Blank checks for email, password hash, and workspace name trim an explicit shared Unicode White_Space set; they reject empty/whitespace-only strings without modifying stored text. Invisible formatting characters outside that set, such as zero-width space, are not treated as whitespace. No password hashing service or authentication endpoint is implemented; `password_hash` stores only a future service-produced hash, and the default model representation does not expose column values.
+
+## Ownership, relationships, and deletion
+
+`Workspace.owner_id` is the unique authoritative ownership source. An owner does not need a membership row, and deleting or losing a membership cannot change ownership. `owner` is not a legal member role; the future authorization layer must always give the owner highest workspace permissions. WorkspaceMember records ordinary collaborators with admin/editor/viewer roles and defaults to viewer.
+
+Relationships use explicit `back_populates`: User.owned_workspaces ↔ Workspace.owner, User.workspace_memberships ↔ WorkspaceMember.user, and Workspace.memberships ↔ WorkspaceMember.workspace. There are no overlapping direct many-to-many shortcuts. A user may own many workspaces, including several with the same name.
+
+Deleting a user who still owns a workspace is rejected by the owner FK's `ON DELETE RESTRICT`. User.owned_workspaces uses `passive_deletes="all"` with no delete cascade so ORM deletion does not null out owner IDs or delete owned workspaces, even when that relationship is loaded. Workspace and ordinary user deletion remove associated membership rows using `ON DELETE CASCADE`; membership collections also use ORM delete-orphan cascade and passive deletion for unloaded collections.
+
+Database constraints guarantee references, non-null/nonblank values, email uniqueness under the stated case rules, valid member roles, unique member pairs, and the deletion policies. They do not verify the caller, account activation, access to a supplied workspace ID, role-specific actions, ownership transfer, or whether an owner has also been inserted as an ordinary member. Stage 03 must prevent redundant owner membership in its service layer and authorize every workspace operation using the authenticated user plus `owner_id` **or** an effective membership. A workspace ID supplied by the frontend is never sufficient authority. No permission API, authentication middleware, or database row-level security is implemented in this stage.
+
+## Timestamp behavior
+
+User and Workspace share non-null `created_at` and `updated_at`; WorkspaceMember has non-null `joined_at`. All use `DateTime(timezone=True)` and database `now()` insert defaults. `updated_at` also has SQLAlchemy `onupdate=func.now()`, applied when an ORM (or SQLAlchemy Core) UPDATE omits an explicit updated_at value. No-op ORM flushes do not issue an UPDATE. Direct SQL bypasses this client-side rule and leaves updated_at unchanged unless the statement sets it. There is no update trigger or automatic database-side update rule; such a requirement would need a later migration. PostgreSQL `now()` is the transaction timestamp, so several updates in one transaction need not have strictly increasing timestamps.
+
 ## Intended growth path
 
-Future capabilities should be added behind tested service boundaries rather than placed directly in the route module. Business models and migrations should be introduced in a later stage once their ownership and lifecycle are defined.
+Future capabilities should be added behind tested service boundaries rather than placed directly in the route module. Stage 02C can generate and review Alembic migrations from this metadata; Stage 03 can add input normalization, password hashing, authentication, and workspace authorization. Model definitions alone do not deploy schema or enforce request permissions.
 

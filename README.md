@@ -1,6 +1,6 @@
 # PaperPilot ResearchOps
 
-PaperPilot ResearchOps 是面向 AI 科研工作流与实验智能管理的全栈平台。当前 Stage 02A 在已有 Next.js 与 FastAPI 基础上增加了 PostgreSQL 连接和数据库就绪检查。
+PaperPilot ResearchOps 是面向 AI 科研工作流与实验智能管理的全栈平台。Stage 02A 提供 PostgreSQL 连接和数据库就绪检查；当前 Stage 02B 新增用户、工作空间与成员角色的 ORM 定义，尚未在 PostgreSQL 部署业务表。
 
 ## 技术栈
 
@@ -100,11 +100,14 @@ npm run dev
 Set-Location backend
 .\.venv\Scripts\Activate.ps1
 python -m pytest -q
+python -m pytest -q -m "not integration"
 python -m pytest -q -m integration
 python -m pip check
 ```
 
 `integration` 标记的测试读取本机 `backend/.env` 并连接真实 PostgreSQL；缺少该文件时会明确跳过，不能用 Mock 结果替代。
+
+模型单元测试不依赖 `.env`，只在启用外键检查的 SQLite 内存库中验证约束，并离线编译 PostgreSQL DDL。SQLite 与 PostgreSQL 的大小写、长度和时区行为存在差异，详细边界见架构文档。真实 PostgreSQL 测试仍只执行只读 `SELECT 1`。
 
 前端检查：
 
@@ -124,13 +127,17 @@ paperpilot-researchops/
 │   ├── app/
 │   │   ├── __init__.py
 │   │   ├── core/config.py
+│   │   ├── db/base.py
 │   │   ├── db/session.py
+│   │   ├── models/             # User、Workspace、WorkspaceMember
 │   │   └── main.py
 │   ├── tests/
 │   │   ├── __init__.py
 │   │   ├── test_config.py
 │   │   ├── test_database_integration.py
+│   │   ├── test_database_reporting.py
 │   │   ├── test_health.py
+│   │   ├── test_models.py
 │   │   └── test_readiness.py
 │   ├── pytest.ini
 │   └── requirements.txt
@@ -161,9 +168,24 @@ paperpilot-researchops/
 
 ## 当前阶段边界
 
-Stage 02A 只建立数据库配置、连接池、Session 生命周期和只读就绪查询，不创建业务表，也不引入 Alembic、Docker、Redis、云部署、研究 Agent 编排或大模型 API。
+Stage 02B 在既有连接层上建立统一 Base.metadata、ORM 字段、关系、约束和离线测试，不创建真实业务表。所有权只由 Workspace.owner_id 表示，成员角色仅限 admin/editor/viewer；尚未实现认证或请求级授权。Stage 02C 才引入 Alembic 迁移。本阶段不引入 Docker、Redis、云部署、研究 Agent 编排或大模型 API。
 
 ## 本地验证记录
+
+Stage 02B 验证日期：2026-11-19（Windows PowerShell）。
+
+| 检查项 | 实际结果 |
+| --- | --- |
+| 模型测试（含 PostgreSQL DDL 离线编译） | 54 passed，警告视为错误时仍通过 |
+| 非集成测试（含 API 与脱敏回归） | 61 passed，1 deselected |
+| `python -m pip check` | `No broken requirements found.` |
+| 实际 Uvicorn `/api/v1/health` | HTTP 200，健康响应保持不变 |
+| 实际 Uvicorn `/api/v1/ready` | HTTP 200，数据库状态为 ready |
+| 真实 PostgreSQL 集成测试 | 1 passed，61 deselected；真实 `SELECT 1` 返回 `1` |
+| 全量 pytest | 62 passed，无失败、无跳过 |
+| PostgreSQL Schema | 未执行 DDL，表定义只注册于 Python metadata |
+
+首次集成检查因本地 PostgreSQL 未运行而连接超时。启动既有实例后已重新执行上述检查，所有命令退出状态均为 0；本次真实数据库验证通过。
 
 Stage 02A 验证日期：2026-11-17（Windows PowerShell）。
 
