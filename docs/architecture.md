@@ -1,8 +1,8 @@
 # PaperPilot ResearchOps Architecture
 
-## Stage 02B scope
+## Stage 02C-1 scope: migration preparation
 
-Stage 02A established synchronous PostgreSQL connectivity, configuration, session lifecycle management, and a readiness probe. Stage 02B adds the User, Workspace, and WorkspaceMember ORM definitions and offline schema tests. These definitions are not deployed tables: this stage does not create or change PostgreSQL schema. Alembic migrations belong to Stage 02C. Authentication, authorization APIs, queues, containers, caches, agent frameworks, and model providers remain outside this stage.
+Stage 02A established synchronous PostgreSQL connectivity, configuration, session lifecycle management, and a readiness probe. Stage 02B added User, Workspace, and WorkspaceMember ORM definitions and offline schema tests. Stage 02C-1 prepares Alembic configuration, a frozen initial revision, and offline migration tests. These definitions are not deployed tables: this stage does not create or change PostgreSQL schema. Applying a real migration requires separate human approval in Stage 02C-2. Authentication, authorization APIs, queues, containers, caches, agent frameworks, and model providers remain outside this stage.
 
 ## Runtime topology
 
@@ -38,6 +38,7 @@ The homepage is mostly a React Server Component. Only the health-status widget i
 - `backend/app/db/session.py` owns the synchronous engine, connection pool, session factory, and connectivity check.
 - `backend/app/db/base.py` owns the shared declarative metadata and UUID/timestamp mixins.
 - `backend/app/models/` owns identity, workspace ownership, and collaborator mappings.
+- `backend/alembic.ini` and `backend/alembic/` own migration configuration, the environment, the revision template, and immutable schema history.
 - `backend/tests/` owns API contract and middleware checks.
 - `docs/` records architecture decisions that apply across both runtimes.
 
@@ -116,5 +117,19 @@ User and Workspace share non-null `created_at` and `updated_at`; WorkspaceMember
 
 ## Intended growth path
 
-Future capabilities should be added behind tested service boundaries rather than placed directly in the route module. Stage 02C can generate and review Alembic migrations from this metadata; Stage 03 can add input normalization, password hashing, authentication, and workspace authorization. Model definitions alone do not deploy schema or enforce request permissions.
+Future capabilities should be added behind tested service boundaries rather than placed directly in the route module. Stage 02C-1 prepares migrations from this metadata; Stage 02C-2 can apply reviewed migrations only after approval and backup. Stage 03 can add input normalization, password hashing, authentication, and workspace authorization. Model definitions alone do not deploy schema or enforce request permissions.
+
+## Alembic configuration and version history
+
+Alembic 1.20.1 is pinned in `backend/requirements.txt`. `backend/alembic.ini` resolves its script directory and Python import path relative to the INI file and contains no database URL. `backend/alembic/env.py` imports `app.models` and supplies the shared `Base.metadata` as `target_metadata` with type comparison enabled. No application startup path imports this environment or invokes migrations.
+
+Offline mode configures the PostgreSQL dialect directly with literal binds. It neither loads Settings nor constructs or connects an engine. From `backend`, run `.\.venv\Scripts\python.exe -m alembic upgrade head --sql` to preview SQL; **never remove `--sql` during this stage**. The output includes transactional DDL and Alembic version tracking statements, without applying them or inspecting a live database. `heads` and `history --verbose` inspect script history without a connection.
+
+Online mode uses an explicitly supplied `Config.attributes["connection"]` when present; otherwise it reuses `app.db.session.get_engine()` and the existing Settings/credential lifecycle. It does not interpolate passwords into INI strings, configure URL logging, or create a second credential source. Driver and Settings failures become generic Alembic CommandError messages containing only the exception type, with sensitive messages and chained context suppressed. External tooling must also avoid logging connections, locals, or full tracebacks containing credentials.
+
+The sole initial revision is `20261120_0001`, in `backend/alembic/versions/20261120_0001_create_initial_tables.py`, with no parent. It creates users, then workspaces, then workspace_members; the stable PK/FK/CHECK/index names match the ORM. It freezes column types, server defaults, nonblank whitespace checks, the unique lower(email) index, RESTRICT ownership deletion, CASCADE membership deletion, the member pair PK, and allowed roles. It intentionally adds no UUID server default or updated_at trigger. Revision code imports only SQLAlchemy and Alembic, preserving historical schema independently of future models. Future schema changes require additional revisions rather than editing an already applied revision.
+
+The script head describes available migration history, not the live database version. Applying a revision would create/update `alembic_version`; offline SQL only renders those statements. This stage does not stamp or apply revisions, and does not assume an empty database. Prior to a real upgrade, verify the target database/schema, existing relations and constraints, existing Alembic version rows, privileges, and migration history; resolve conflicts and prepare a tested backup/recovery plan before requesting human approval. Initial downgrade removes all three business tables and data, so it must not be run casually against a real database.
+
+`backend/tests/test_migrations.py` captures real Alembic operations in an offline MigrationContext and compares columns, types, nullability, server defaults, named constraints, FK policies and indexes against the ORM. It checks one base/head, creation order, SQL generation, and reverse downgrade ordering. Connection guards reject real engine/driver connections. Offline tests forbid Settings loading and engine construction; online environment and error tests use mocks only. PostgreSQL DDL is not executed by these tests. A separately approved disposable PostgreSQL instance is still required to validate actual upgrade/downgrade behavior later.
 

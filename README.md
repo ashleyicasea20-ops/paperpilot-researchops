@@ -1,11 +1,11 @@
 # PaperPilot ResearchOps
 
-PaperPilot ResearchOps 是面向 AI 科研工作流与实验智能管理的全栈平台。Stage 02A 提供 PostgreSQL 连接和数据库就绪检查；当前 Stage 02B 新增用户、工作空间与成员角色的 ORM 定义，尚未在 PostgreSQL 部署业务表。
+PaperPilot ResearchOps 是面向 AI 科研工作流与实验智能管理的全栈平台。当前 Stage 02C-1 为迁移脚本准备阶段：在 Stage 02B 的 ORM 基础上引入 Alembic 初始迁移和离线验证，尚未在 PostgreSQL 部署业务表。
 
 ## 技术栈
 
 - Frontend: Next.js 16, React 19, TypeScript, Tailwind CSS 4, App Router
-- Backend: Python 3.11, FastAPI, Uvicorn, SQLAlchemy 2.x, Psycopg 3
+- Backend: Python 3.11, FastAPI, Uvicorn, SQLAlchemy 2.x, Psycopg 3, Alembic 1.20.1
 - Database: PostgreSQL 17
 - Testing: pytest, HTTPX / FastAPI TestClient
 
@@ -124,6 +124,11 @@ paperpilot-researchops/
 ├── backend/
 │   ├── .env.example
 │   ├── .venv/                 # 本地虚拟环境，不提交
+│   ├── alembic.ini
+│   ├── alembic/
+│   │   ├── env.py
+│   │   ├── script.py.mako
+│   │   └── versions/20261120_0001_create_initial_tables.py
 │   ├── app/
 │   │   ├── __init__.py
 │   │   ├── core/config.py
@@ -138,6 +143,7 @@ paperpilot-researchops/
 │   │   ├── test_database_reporting.py
 │   │   ├── test_health.py
 │   │   ├── test_models.py
+│   │   ├── test_migrations.py
 │   │   └── test_readiness.py
 │   ├── pytest.ini
 │   └── requirements.txt
@@ -168,9 +174,47 @@ paperpilot-researchops/
 
 ## 当前阶段边界
 
-Stage 02B 在既有连接层上建立统一 Base.metadata、ORM 字段、关系、约束和离线测试，不创建真实业务表。所有权只由 Workspace.owner_id 表示，成员角色仅限 admin/editor/viewer；尚未实现认证或请求级授权。Stage 02C 才引入 Alembic 迁移。本阶段不引入 Docker、Redis、云部署、研究 Agent 编排或大模型 API。
+Stage 02B 在既有连接层上建立统一 Base.metadata、ORM 字段、关系、约束和离线测试。Stage 02C-1 准备 Alembic 迁移文件和 PostgreSQL 离线 SQL，不创建真实业务表。所有权只由 Workspace.owner_id 表示，成员角色仅限 admin/editor/viewer；尚未实现认证或请求级授权。本阶段不引入 Docker、Redis、云部署、研究 Agent 编排或大模型 API。
+
+## Alembic 迁移（Stage 02C-1：迁移脚本准备）
+
+Alembic 通过有序 revision 管理数据库 Schema 版本。配置位于 `backend/alembic.ini`，环境入口为 `backend/alembic/env.py`，模板为 `backend/alembic/script.py.mako`，历史脚本位于 `backend/alembic/versions/`，迁移测试为 `backend/tests/test_migrations.py`。
+
+唯一初始 revision 为 `20261120_0001`（`create_initial_tables`），父版本为 base。它按依赖顺序创建 `users`、`workspaces`、`workspace_members`，包含既有 ORM 的字段、命名约束、外键删除策略和索引。UUID 不增加数据库默认值；`updated_at` 仍由 SQLAlchemy 更新，没有数据库更新触发器。历史迁移自包含，不导入会随业务变化的模型。
+
+在 `backend` 目录使用项目虚拟环境查看脚本历史和生成 SQL：
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic heads
+.\.venv\Scripts\python.exe -m alembic history --verbose
+.\.venv\Scripts\python.exe -m alembic upgrade head --sql
+```
+
+最后一条命令的 **`--sql` 必须保留**：它仅输出 PostgreSQL SQL，不连接数据库、不需要 `.env` 或真实密码，也不记录任何实际升级状态。SQL 中包含 `alembic_version` 的创建和版本记录语句，这些语句尚未执行。未来执行迁移后，Alembic 才会在目标库的 `alembic_version` 中跟踪已应用版本；脚本 head 不代表数据库已升级。
+
+在线模式复用现有 `app.db.session.get_engine()` 和 Pydantic Settings，不在 INI 中配置连接 URL。应用启动和模型导入不会自动执行迁移。
+
+**真实迁移必须先经人工审查和批准。** 升级前确认数据库、schema、已有表、`alembic_version` 与 revision 历史是否一致，检查同名对象冲突，并完成可恢复备份及恢复方案。已有表不能通过盲目 stamp 来认领。Stage 02C-2 才考虑实际应用迁移；不得在本阶段执行在线 upgrade、downgrade 或 stamp。初始 downgrade 会删除三张业务表及其数据，禁止随意在真实数据库执行。
+
+迁移单元测试仅捕获 Alembic 操作、比较 SQLAlchemy 结构并离线编译 SQL；在线配置测试使用替身连接。真实 PostgreSQL 测试仍只有只读 `SELECT 1`。这些验证不替代未来在经批准的隔离数据库上的原生迁移验证。
 
 ## 本地验证记录
+
+Stage 02C-1 验证日期：2026-11-20（Windows PowerShell；桌面项目 `backend`，项目 `.venv` Python 3.11.6）。
+
+| 检查项 | 实际结果 |
+| --- | --- |
+| Alembic | 1.20.1；其余原有固定依赖未升级 |
+| 迁移测试 | 新增 17 项，随非集成与全量测试通过 |
+| 非集成测试 | 78 passed，1 deselected |
+| PostgreSQL 只读集成测试 | 1 passed，78 deselected |
+| 全量 pytest | 79 passed，0 failed，0 skipped |
+| pip check | No broken requirements found. |
+| revision history / heads | 唯一初始 revision 和 head：20261120_0001 |
+| PostgreSQL 离线 SQL | 生成成功；字段、命名约束、索引和依赖顺序已核对 |
+| 真实数据库 | 只读检查；当前 schema 为 public，未发现三张业务表或 alembic_version；未应用迁移 |
+
+上述命令退出状态均为 0；历史 Stage 02B 记录保留如下。
 
 Stage 02B 验证日期：2026-11-19（Windows PowerShell）。
 
