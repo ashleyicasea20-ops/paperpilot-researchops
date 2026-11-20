@@ -3,18 +3,39 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
+from fastapi import routing as fastapi_routing
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
+from starlette.exceptions import HTTPException
 
-from app.db.session import get_db_session
+from app.db.session import REGISTRATION_COMMITTED, get_db_session
 from app.schemas.auth import RegisterRequest, UserResponse
 from app.services.registration import (
     EmailAlreadyRegistered, RegistrationFailed, RegistrationUnavailable,
     is_database_unavailable, register_user,
 )
+
+
+def _is_fastapi_body_parse_error(error: HTTPException) -> bool:
+    if (
+        type(error) is not HTTPException
+        or error.status_code != 400
+        or error.detail != "There was an error parsing the body"
+        or error.__cause__ is None
+    ):
+        return False
+
+    # FastAPI uses a plain HTTPException here. Verify where it was raised so
+    # explicit HTTP errors with the same status, detail and cause pass through.
+    origin = error.__traceback__
+    if origin is None:
+        return False
+    while origin.tb_next is not None:
+        origin = origin.tb_next
+    return origin.tb_frame.f_globals is vars(fastapi_routing)
 
 
 class RegistrationRoute(APIRoute):
@@ -59,6 +80,16 @@ class RegistrationRoute(APIRoute):
                 return await handler(request)
             except RequestValidationError:
                 code, detail = 422, "Invalid registration input"
+            except HTTPException as exc:
+                if not _is_fastapi_body_parse_error(exc):
+                    raise
+                cause = exc.__cause__
+                if isinstance(cause, UnicodeDecodeError):
+                    code, detail = 422, "Invalid registration input"
+                elif isinstance(cause, RuntimeError) and not isinstance(cause, RecursionError):
+                    code, detail = 500, "Registration failed"
+                else:
+                    raise
             except EmailAlreadyRegistered:
                 code, detail = 409, "Email is already registered"
             except RegistrationUnavailable:
@@ -90,4 +121,6 @@ def register(
     request: RegisterRequest,
     session: Annotated[Session, Depends(get_db_session, scope="function")],
 ) -> UserResponse:
-    return register_user(session, request)
+    response = register_user(session, request)
+    session.info[REGISTRATION_COMMITTED] = True
+    return response

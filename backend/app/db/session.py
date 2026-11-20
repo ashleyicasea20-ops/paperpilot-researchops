@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from functools import lru_cache
+import logging
 
 from pydantic import ValidationError
 from sqlalchemy import Engine, create_engine, text
@@ -11,6 +12,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
+REGISTRATION_COMMITTED = "paperpilot.registration_committed"
 
 
 class DatabaseUnavailableError(RuntimeError):
@@ -49,7 +53,26 @@ def get_db_session() -> Generator[Session, None, None]:
         session.rollback()
         raise
     finally:
+        _close_session(session)
+
+
+def _close_session(session: Session) -> None:
+    registration_committed = session.info.pop(REGISTRATION_COMMITTED, False)
+    try:
         session.close()
+    except Exception:
+        if registration_committed is not True:
+            raise
+    else:
+        return
+
+    # The response is already backed by an acknowledged commit. Invalidate any
+    # connections still held by the session without changing that result.
+    logger.warning("Session cleanup failed after registration commit")
+    try:
+        session.invalidate()
+    except Exception:
+        logger.warning("Session invalidation failed after registration commit")
 
 
 def check_database_connection() -> None:
