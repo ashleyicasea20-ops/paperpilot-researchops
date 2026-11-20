@@ -8,8 +8,9 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
+from starlette.exceptions import HTTPException
 
-from app.db.session import get_db_session
+from app.db.session import REGISTRATION_COMMITTED, get_db_session
 from app.schemas.auth import RegisterRequest, UserResponse
 from app.services.registration import (
     EmailAlreadyRegistered, RegistrationFailed, RegistrationUnavailable,
@@ -59,6 +60,15 @@ class RegistrationRoute(APIRoute):
                 return await handler(request)
             except RequestValidationError:
                 code, detail = 422, "Invalid registration input"
+            except HTTPException as exc:
+                # FastAPI wraps JSON byte decoding errors in this HTTP 400.
+                if not (
+                    exc.status_code == 400
+                    and exc.detail == "There was an error parsing the body"
+                    and isinstance(exc.__cause__, UnicodeDecodeError)
+                ):
+                    raise
+                code, detail = 422, "Invalid registration input"
             except EmailAlreadyRegistered:
                 code, detail = 409, "Email is already registered"
             except RegistrationUnavailable:
@@ -90,4 +100,6 @@ def register(
     request: RegisterRequest,
     session: Annotated[Session, Depends(get_db_session, scope="function")],
 ) -> UserResponse:
-    return register_user(session, request)
+    response = register_user(session, request)
+    session.info[REGISTRATION_COMMITTED] = True
+    return response

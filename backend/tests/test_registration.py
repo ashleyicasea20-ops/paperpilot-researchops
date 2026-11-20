@@ -9,6 +9,7 @@ from unittest.mock import Mock
 from uuid import UUID, uuid4
 
 import httpx
+from fastapi import HTTPException
 from pydantic import ValidationError
 import pytest
 from sqlalchemy import create_engine, event, func, select
@@ -168,6 +169,109 @@ def test_malformed_json_and_invalid_unicode_are_safe(database, content):
     response = send(content=content, headers={"Content-Type": "application/json"})
     assert response.status_code == 422 and response.json() == {"detail": "Invalid registration input"}
     assert "private-malformed-sentinel" not in response.text
+
+
+@pytest.mark.parametrize("body_kind", ["truncated", "invalid_utf8", "invalid_type"])
+def test_registration_input_errors_are_sanitized(database, monkeypatch, caplog, body_kind):
+    marker = "synthetic-invalid-request-marker"
+    hasher = Mock(side_effect=AssertionError("Hasher must not run"))
+    monkeypatch.setattr(registration, "hash_password", hasher)
+    bodies = {
+        "truncated": b'{"password":"' + marker.encode() + b'",',
+        "invalid_utf8": b'{"email":"review@example.com","password":"' + marker.encode() + b'\xff"}',
+        "invalid_type": json.dumps({"email": "review@example.com", "password": [marker]}).encode(),
+    }
+    response = send(content=bodies[body_kind], headers={"Content-Type": "application/json"})
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Invalid registration input"}
+    assert marker not in response.text + caplog.text
+    assert user_count(database) == 0
+    hasher.assert_not_called()
+
+
+def test_unrelated_http_400_keeps_status_and_headers(database):
+    def rejected():
+        raise HTTPException(400, "There was an error parsing the body", headers={"X-Test-Source": "dependency"})
+
+    app.dependency_overrides[get_db_session] = rejected
+    response = send({"email": "review@example.com", "password": PASSWORD})
+    assert response.status_code == 400
+    assert response.headers["X-Test-Source"] == "dependency"
+
+
+def test_close_failure_after_real_commit_preserves_created_user(database, monkeypatch, caplog):
+    marker = "synthetic-post-commit-cleanup-marker"
+
+    class CloseFails(Session):
+        close_attempted = False
+        invalidate_attempted = False
+
+        def close(self):
+            self.close_attempted = True
+            raise RuntimeError(marker)
+
+        def invalidate(self):
+            self.invalidate_attempted = True
+            super().invalidate()
+
+    session = CloseFails(database.engine)
+    app.dependency_overrides.pop(get_db_session)
+    monkeypatch.setattr("app.db.session.get_session_factory", lambda: lambda: session)
+    response = send({"email": " Confirmed@Example.com ", "password": PASSWORD})
+
+    with Session(database.engine) as reader:
+        user = reader.scalars(select(User)).one()
+        expected = {
+            "id": str(user.id),
+            "email": user.email,
+            "is_active": user.is_active,
+            "created_at": user.created_at.isoformat(),
+            "updated_at": user.updated_at.isoformat(),
+        }
+        assert user.email == "confirmed@example.com"
+        assert user.password_hash not in response.text + caplog.text
+    assert session.close_attempted
+    assert response.status_code == 201
+    assert response.json() == expected
+    assert session.invalidate_attempted
+    assert "Session cleanup failed after registration commit" in caplog.text
+    assert marker not in response.text + caplog.text
+    assert PASSWORD not in response.text + caplog.text
+
+
+def test_commit_exception_after_persistence_is_not_reported_as_success(database, monkeypatch, caplog):
+    marker = "synthetic-uncertain-commit-marker"
+
+    class CommitResultUnknown(Session):
+        def commit(self):
+            super().commit()
+            raise OperationalError(None, None, RuntimeError(marker))
+
+    app.dependency_overrides.pop(get_db_session)
+    monkeypatch.setattr("app.db.session.get_session_factory", lambda: lambda: CommitResultUnknown(database.engine))
+    response = send({"email": "uncertain@example.com", "password": PASSWORD})
+    assert response.status_code == 503 and response.json() == {"detail": "Database is unavailable"}
+    assert user_count(database) == 1
+    assert marker not in response.text + caplog.text
+
+
+def test_close_failure_does_not_hide_precommit_failure(database, monkeypatch, caplog):
+    marker = "synthetic-precommit-cleanup-marker"
+
+    class CloseFails(Session):
+        def close(self):
+            super().close()
+            raise RuntimeError(marker)
+
+    app.dependency_overrides.pop(get_db_session)
+    monkeypatch.setattr("app.db.session.get_session_factory", lambda: lambda: CloseFails(database.engine))
+    monkeypatch.setattr(registration.UserResponse, "model_validate", Mock(side_effect=ValueError(marker)))
+    response = send({"email": "uncommitted@example.com", "password": PASSWORD})
+
+    assert response.status_code == 500 and response.json() == {"detail": "Registration failed"}
+    assert user_count(database) == 0
+    assert "Session cleanup failed after registration commit" not in caplog.text
+    assert marker not in response.text + caplog.text
 
 
 def test_commit_failure_rolls_back_flushed_user(database, monkeypatch, caplog):
