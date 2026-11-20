@@ -23,6 +23,7 @@ def get_engine() -> Engine:
 
     return create_engine(
         get_settings().database_url,
+        hide_parameters=True,
         pool_pre_ping=True,
         pool_size=5,
         max_overflow=10,

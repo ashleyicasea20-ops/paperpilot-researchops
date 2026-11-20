@@ -2,7 +2,7 @@
 
 ## Stage 02C status: local database infrastructure complete
 
-Stage 01 completed the frontend/backend foundation. Stage 02A established synchronous PostgreSQL connectivity, Settings, session lifecycle management, and readiness. Stage 02B added User, Workspace, and WorkspaceMember ORM definitions. Stage 02C completed Alembic configuration and initial revision 20261120_0001, an isolated PostgreSQL restoration/migration rehearsal, and the explicitly approved migration of the local development database. The local public schema now contains users, workspaces, workspace_members, and alembic_version. This is local development infrastructure; it is not evidence of a cloud production deployment. Registration, login, authentication, request authorization, and secure tenant isolation remain unimplemented and belong to Stage 03.
+Stage 01 completed the frontend/backend foundation. Stage 02A established synchronous PostgreSQL connectivity, Settings, session lifecycle management, and readiness. Stage 02B added User, Workspace, and WorkspaceMember ORM definitions. Stage 02C completed Alembic configuration and initial revision 20261120_0001, an isolated PostgreSQL restoration/migration rehearsal, and the explicitly approved migration of the local development database. The local public schema now contains users, workspaces, workspace_members, and alembic_version. This is local development infrastructure; it is not evidence of a cloud production deployment. Stage 03A adds registration only, without schema changes. Login, email ownership verification, authentication, request authorization, and secure tenant isolation remain unimplemented.
 
 ## Runtime topology
 
@@ -38,6 +38,10 @@ The homepage is mostly a React Server Component. Only the health-status widget i
 - `backend/app/db/session.py` owns the synchronous engine, connection pool, session factory, and connectivity check.
 - `backend/app/db/base.py` owns the shared declarative metadata and UUID/timestamp mixins.
 - `backend/app/models/` owns identity, workspace ownership, and collaborator mappings.
+- `backend/app/api/v1/auth.py` owns the registration route and its validation/dependency error boundaries.
+- `backend/app/schemas/auth.py` owns registration input and the public response allowlist.
+- `backend/app/core/security.py` owns password policy and reusable Argon2id hashing/verification primitives.
+- `backend/app/services/registration.py` owns user creation, commit/rollback, and precise duplicate classification.
 - `backend/alembic.ini` and `backend/alembic/` own migration configuration, the environment, the revision template, and immutable schema history.
 - `backend/tests/` owns API, model, configuration, and offline migration checks.
 - `docs/` records architecture decisions that apply across both runtimes.
@@ -60,6 +64,26 @@ The Python virtual environment and Node.js dependencies remain local build artif
 
 The `/api/v1` prefix creates room for future non-breaking additions and an explicit migration path for breaking API changes.
 
+### Stage 03A registration contract
+
+`POST /api/v1/auth/register` accepts JSON email/password and returns 201 with only id, normalized email, is_active, created_at, and updated_at. A synthetic request/response example is in the README. It does not return passwords/hashes, tokens, cookies, or internal exception details. Registration does not establish a login session or verify mailbox ownership.
+
+Error responses contain a generic detail: 409 for the recognized email unique-index conflict, 422 for invalid input, 503 for unavailable database/configuration, and 500 for unexpected internal failures. A registration-specific APIRoute wrapper sanitizes RequestValidationError before FastAPI can serialize input, ctx, or exception messages. An outer route boundary also covers dependency cleanup outside the inner handler; function-scoped Session cleanup occurs before the response. Errors are handled without recording raw exceptions. Health/readiness behavior is retained, and CORS adds POST to GET while preserving the Origin allowlist and disabled credentials.
+
+Email input must be a string: trim surrounding whitespace, validate using EmailStr/email-validator without DNS checks, then lowercase and enforce ASCII plus the 320-character storage limit. The library's stricter syntax/length rules still apply. Both input and normalized output must be ASCII; display-name addresses and internationalized email are rejected in V1. Plus tags and dots remain intact. No provider-specific comparison rule is introduced; the database lower(email) index remains authoritative.
+
+Passwords contain 15 through 128 Unicode code points and at most 1024 UTF-8 bytes. No trimming, case conversion, or composition rules are applied. With valid Unicode the 128-code-point cap is already stricter than the byte cap; both checks are retained. Invalid Unicode and non-string values are rejected before hashing. Request password fields use SecretStr and are excluded from repr. pwdlib[argon2] 0.4.2 uses PasswordHash.recommended() and Argon2id with library-managed random salt; email-validator is pinned at 2.4.0. No custom hash or encryption is implemented. The stored hash fits String(255), and the response schema has an explicit public field allowlist.
+
+The synchronous route reuses get_db_session. The service hashes the validated password, adds the existing User model, flushes server-generated values, constructs the public response, and commits. Constructing the response before commit allows validation failures to roll back. Other failures attempt rollback; the existing dependency always attempts close. SQLAlchemy engine parameters are hidden, and application code does not log passwords, hashes, request bodies, or raw driver errors. External logging/APM must retain equivalent redaction.
+
+There is no uniqueness prequery: concurrent insertion is arbitrated by uq_users_email_lower. PostgreSQL mapping requires both SQLSTATE 23505 and the exact diagnostic index name; SQLite tests recognize only its specific unique-index error code and message. Other integrity/programming errors produce 500, not 409. Database connection errors produce 503, including dependency setup failures. A network failure during commit can make the result uncertain; rollback cannot undo an already acknowledged server commit, so a later client retry may encounter 409. This API has not added idempotency, login recovery, rate limiting, or a complete production authentication system.
+
+### Registration test safety
+
+New tests use only an isolated SQLite in-memory Engine with foreign keys and dependency_overrides. Sessions and Engines are released, and PostgreSQL connection attempts are blocked in the API tests. Tests cover real Argon2id, input/response secrecy, real SQLite rollback, and simulated PostgreSQL diagnostics. They do not prove PostgreSQL two-connection race behavior. The existing real PostgreSQL integration test remains SELECT 1 only.
+
+paperpilot_auth_test is a reserved future database name, not a created or configured database. No new PostgreSQL registration write test is enabled. Future write testing requires explicit approval, a separate database, an opt-in such as PAPERPILOT_AUTH_PG_TESTS=1, actual identity/schema/revision checks, and rejection of paperpilot_dev and paperpilot_migration_test. An outer Connection transaction with SAVEPOINT isolation (for example Session join_transaction_mode="create_savepoint") must allow service-level commit to be undone by the outer rollback. Concurrent two-connection behavior needs a separately approved test design. No schema change or migration belongs to Stage 03A.
+
 ## Configuration and security
 
 - The frontend reads `NEXT_PUBLIC_API_BASE_URL`; the `NEXT_PUBLIC_` prefix means the value is intentionally visible in the browser bundle.
@@ -73,7 +97,7 @@ The `/api/v1` prefix creates room for future non-breaking additions and an expli
 
 The engine and session factory are created lazily and cached once per process. This keeps `/api/v1/health` operational when database configuration is absent while `/api/v1/ready` accurately reports the database dependency. The engine uses `pool_pre_ping`, a five-connection base pool, up to ten overflow connections, a five-second pool wait, a five-second driver connection timeout, and periodic connection recycling.
 
-Application sessions are request-scoped generators: successful use closes the session, exceptions trigger rollback, and the connection is always returned to the pool. Stage 02A exposes the session provider for later data access but does not create tables or persist domain data.
+Application sessions are dependency-scoped generators: successful use closes the session, exceptions trigger rollback, and the connection is returned to the pool. Stage 02A introduced this provider without persistence. Stage 03A registration explicitly uses function scope and owns its service-level commit/rollback; no startup path creates tables or performs migrations.
 
 ## Verification boundary
 
@@ -99,7 +123,7 @@ The metadata naming convention generates `pk_<table>`, `fk_<table>_<column>_<tar
 
 `Uuid(as_uuid=True)` maps Python `uuid.UUID` to native PostgreSQL UUID. A shared UUID mixin uses the callable `uuid4`, generating a fresh ID at SQLAlchemy insert time, not when constructing an unsaved object. There is no UUID server default, so direct SQL inserts must supply IDs. WorkspaceMember uses its two FKs as the primary key and has no redundant ID or workspace-only index; the composite primary key already supports workspace-prefix lookups.
 
-The unique email index provides database protection against case variants according to PostgreSQL `lower()` and the database's locale/collation. It does not implement full Unicode case folding, Unicode normalization, whitespace stripping, or email syntax validation. Unicode case behavior may differ across collations and from Python `casefold()`; no universal Unicode-equivalence claim is made. Stage 03 must define and validate the input policy (including strip/lower and internationalized addresses) consistently before writes. Blank checks for email, password hash, and workspace name trim an explicit shared Unicode White_Space set; they reject empty/whitespace-only strings without modifying stored text. Invisible formatting characters outside that set, such as zero-width space, are not treated as whitespace. No password hashing service or authentication endpoint is implemented; `password_hash` stores only a future service-produced hash, and the default model representation does not expose column values.
+The unique email index provides database protection against case variants according to PostgreSQL `lower()` and the database's locale/collation. It does not implement full Unicode case folding, Unicode normalization, whitespace stripping, or email syntax validation. Unicode case behavior may differ across collations and from Python `casefold()`; no universal Unicode-equivalence claim is made. Stage 03A enforces the ASCII-only strip/validate/lower policy before registration writes. Blank checks for email, password hash, and workspace name trim an explicit shared Unicode White_Space set; they reject empty/whitespace-only strings without modifying stored text. Invisible formatting characters outside that set, such as zero-width space, are not treated as whitespace. Registration now writes service-produced Argon2id hashes; login and mailbox verification are not implemented, and the default model representation does not expose column values.
 
 ## Ownership, relationships, and deletion
 
@@ -117,7 +141,7 @@ User and Workspace share non-null `created_at` and `updated_at`; WorkspaceMember
 
 ## Intended growth path
 
-Future capabilities should be added behind tested service boundaries rather than placed directly in the route module. Stage 02C has applied the initial schema to the validated local development environment. Stage 03 will implement registration, login, input normalization, password hashing, authentication, workspace authorization, and tenant isolation policy. Deployed tables do not themselves authenticate callers or enforce request permissions.
+Future capabilities should be added behind tested service boundaries rather than placed directly in the route module. Stage 02C applied the initial schema to the validated local development environment; Stage 03A implements registration, input normalization, and password hashing. Login, mailbox verification, authentication, workspace authorization, and tenant isolation policy belong to later stages. Deployed tables and a registration API do not themselves authenticate callers or enforce request permissions.
 
 ## Alembic configuration and version history
 
@@ -152,4 +176,10 @@ The pre-migration empty development archive was actually restored into an indepe
 The Stage 02C-2B/2C-2 execution records report successful isolated rehearsal, 17 native constraint test groups, committed local development migration, 79 passing pytest cases, a clean pip check, and verified post-migration archive readability. These are historical execution results.
 
 During the documentation review on 2026-11-20, fresh read-only checks confirmed PostgreSQL 17.12, public schema, unique revision 20261120_0001, all four expected tables, 3 business PKs/3 FKs/4 CHECKs/3 secondary indexes, zero rows in each business table, and no ORM differences. This review did not apply migrations or repeat write-based constraint tests. After the documentation edits, the project's Python 3.11.6 virtual environment ran the full pytest suite from the backend directory: 79 passed, 0 failed, 0 skipped, exit code 0. A fresh pip check also passed with exit code 0. Read-only structure checks before and after the regression were identical.
+
+### Stage 03A evidence
+
+The Stage 02C records above are preserved historical evidence. On 2026-11-20 the project's Python 3.11.6 environment executed 20 security tests, 54 registration API tests, 152 non-integration tests (1 deselected), and the full 153-test suite including the existing PostgreSQL SELECT 1. Every command exited 0; the full suite had no failures or skips. pip check also passed. The 74 added tests do not replace or remove any of the original 79 tests.
+
+PostgreSQL connections in the test processes were restricted to read-only; registration API tests additionally block PostgreSQL connection attempts. Fresh read-only comparisons before and after validation confirmed unchanged schema/version fingerprints and zero business rows in paperpilot_dev and paperpilot_migration_test. No PostgreSQL registration writes, schema changes, real concurrency test, or new authentication database are executed by this stage.
 

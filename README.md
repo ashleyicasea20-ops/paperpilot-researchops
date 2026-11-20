@@ -10,14 +10,16 @@ PaperPilot ResearchOps 是面向 AI 科研工作流与实验智能管理的全�
 | Stage 02A | 完成：PostgreSQL 连接、Engine/Session、Settings 与 readiness |
 | Stage 02B | 完成：User、Workspace、WorkspaceMember ORM、约束及关系 |
 | Stage 02C | 完成：Alembic 初始迁移、独立测试库验证、本地开发库迁移和备份 |
-| Stage 03 | 待开发：注册、登录、密码哈希、认证、工作空间权限管理及租户隔离策略 |
+| Stage 03A | 已实现：用户注册、邮箱规范化、密码策略和 Argon2id 哈希；待人工验收 |
+| Stage 03B 及后续 | 待开发：登录、邮箱归属验证、认证、工作空间权限管理及租户隔离策略 |
 
-当前没有用户注册、登录、认证、请求级授权或多租户安全隔离。ORM 关系和数据库约束不等同于访问控制。
+当前提供注册 API，但尚未实现登录、邮箱归属验证、认证、请求级授权或多租户安全隔离。注册成功不代表已经登录；ORM 关系和数据库约束不等同于访问控制。该接口不能单独视为生产就绪的完整认证系统。
 
 ## 技术栈
 
 - Frontend: Next.js 16, React 19, TypeScript, Tailwind CSS 4, App Router
 - Backend: Python 3.11, FastAPI, Uvicorn, SQLAlchemy 2.x, Psycopg 3, Alembic 1.20.1
+- Registration: pwdlib[argon2] 0.4.2, email-validator 2.4.0
 - Database: PostgreSQL 17
 - Testing: pytest, HTTPX / FastAPI TestClient
 
@@ -95,6 +97,51 @@ Invoke-RestMethod http://127.0.0.1:8000/api/v1/ready
 - `/api/v1/health` 是进程健康检查，不访问数据库。
 - `/api/v1/ready` 连接 PostgreSQL 并执行 `SELECT 1`；成功返回 HTTP 200，配置缺失或数据库不可用时返回 HTTP 503。
 
+## 用户注册（Stage 03A）
+
+`POST /api/v1/auth/register` 接收 `Content-Type: application/json`。以下仅为虚构契约示例；自动化注册测试使用内存 SQLite 和依赖覆盖，不向现有 PostgreSQL 开发库或迁移演练库发送测试注册请求。
+
+```json
+{
+  "email": " Researcher@Example.COM ",
+  "password": "A-long-example-passphrase-2026"
+}
+```
+
+成功响应示例（HTTP 201；ID 和时间均为示例）：
+
+```json
+{
+  "id": "00000000-0000-4000-8000-000000000001",
+  "email": "researcher@example.com",
+  "is_active": true,
+  "created_at": "2026-11-20T00:00:00Z",
+  "updated_at": "2026-11-20T00:00:00Z"
+}
+```
+
+| 状态码 | 含义 / 错误 detail |
+| --- | --- |
+| 201 | 创建成功，仅返回 id、email、is_active、created_at、updated_at |
+| 409 | Email is already registered |
+| 422 | Invalid registration input |
+| 503 | Database is unavailable |
+| 500 | Registration failed |
+
+邮箱先去除首尾空白，使用 Pydantic EmailStr / email-validator 验证，再统一为小写；输入和规范化结果均必须为 ASCII，规范化结果最长 320 字符，库的邮箱语法限制也同时生效。V1 不支持国际化邮箱或显示名形式，不查询 DNS，也不证明邮箱属于调用者。保留 `+tag` 和地址中的点，不做服务商专有身份合并。
+
+密码为 15–128 个 Unicode 码点、最多 1024 个 UTF-8 字节；不 strip、不改大小写、不要求字符种类组合。验证发生在哈希之前。pwdlib 的 `PasswordHash.recommended()` 使用 Argon2id 和随机 salt；数据库只保存哈希。请求密码由 SecretStr 包装且不进入 repr；响应使用公开字段白名单。422 使用固定错误内容，不返回 Pydantic 的 input、ctx 或原始 msg，避免非法类型、嵌套输入和解析错误回显密码。
+
+同步路由复用原有 Session 依赖。服务先添加并 flush 用户，取得服务器默认值并构造公开响应，再 commit；失败会尝试 rollback，依赖负责 close。最终去重由 `uq_users_email_lower` 唯一索引保证，不能用预查询代替。PostgreSQL 仅在 SQLSTATE 为 23505 且诊断名称为该索引时返回 409；其他约束或编程错误不会被当作重复邮箱。数据库连接及配置故障返回脱敏 503，其余内部错误返回通用 500。注册路由单独保护校验、依赖初始化和依赖清理路径，应用不记录密码、哈希或原始数据库错误；SQLAlchemy 参数已隐藏，外部日志和 APM 也应避免收集敏感请求体。
+
+CORS 保留原 Origin 白名单，允许 GET 与 POST，不启用跨域 Cookie。注册不创建 Token、登录会话、邮箱验证码或工作空间；目前也不提供登录、密码重置和权限 API。
+
+### 注册测试与 PostgreSQL 隔离
+
+新增安全及 API 测试通过 `dependency_overrides` 注入独立内存 SQLite Session，启用外键，并在结束后关闭 Session、释放 Engine。新测试阻止真实 PostgreSQL 连接；既有 PostgreSQL integration 测试仍只有只读 `SELECT 1`。数据库约束及模拟的 PostgreSQL 诊断异常验证了去重路径，但不代表真实双连接并发注册已通过。
+
+未来 PostgreSQL 注册写入测试仅预留 `paperpilot_auth_test` 名称；本阶段不创建、迁移或写入该库，也没有默认启用的 PostgreSQL 注册写入测试。后续必须另行批准，显式 opt-in（例如 `PAPERPILOT_AUTH_PG_TESTS=1`），检查实际数据库、Schema 和 revision，并拒绝 `paperpilot_dev` 与 `paperpilot_migration_test`。应使用显式测试连接、外层事务和 SAVEPOINT，使服务内部 commit 仍可由外层 rollback 撤销；真正的双连接并发验证另行设计和授权。
+
 ## 启动前端
 
 在另一个 PowerShell 终端中：
@@ -146,10 +193,14 @@ paperpilot-researchops/
 │   │   └── versions/20261120_0001_create_initial_tables.py
 │   ├── app/
 │   │   ├── __init__.py
+│   │   ├── api/v1/auth.py      # 注册路由及脱敏边界
 │   │   ├── core/config.py
+│   │   ├── core/security.py    # 密码策略和 Argon2id
 │   │   ├── db/base.py
 │   │   ├── db/session.py
 │   │   ├── models/             # User、Workspace、WorkspaceMember
+│   │   ├── schemas/auth.py     # 注册输入与公开响应
+│   │   ├── services/registration.py
 │   │   └── main.py
 │   ├── tests/
 │   │   ├── __init__.py
@@ -159,6 +210,8 @@ paperpilot-researchops/
 │   │   ├── test_health.py
 │   │   ├── test_models.py
 │   │   ├── test_migrations.py
+│   │   ├── test_registration.py
+│   │   ├── test_security.py
 │   │   └── test_readiness.py
 │   ├── pytest.ini
 │   └── requirements.txt
@@ -189,7 +242,7 @@ paperpilot-researchops/
 
 ## 当前阶段边界
 
-Stage 02B 建立统一 Base.metadata、ORM 字段、关系、约束和离线测试。Stage 02C 已完成初始迁移，并在独立测试库及本地开发库应用 `20261120_0001`。所有权只由 Workspace.owner_id 表示，成员角色仅限 admin/editor/viewer；认证和请求级权限管理属于 Stage 03。当前完成的是本地数据库基础设施，不包含 Docker、Redis、云部署、研究 Agent 编排或大模型 API。
+Stage 02B 建立统一 Base.metadata、ORM 字段、关系、约束和离线测试。Stage 02C 已完成初始迁移，并在独立测试库及本地开发库应用 `20261120_0001`。Stage 03A 只增加注册服务，没有变更 Schema 或历史 revision。所有权仍只由 Workspace.owner_id 表示，成员角色仅限 admin/editor/viewer；登录、认证和请求级权限管理留待后续阶段。不包含前端注册页面、JWT、OAuth、Docker、Redis、云部署、研究 Agent 编排或大模型 API。
 
 ## Alembic 迁移（Stage 02C 已完成）
 
@@ -222,6 +275,20 @@ SQL 预览命令中的 **`--sql` 必须保留**：它仅生成从 base 开始的
 仓库内迁移单元测试捕获 Alembic 操作、比较 SQLAlchemy 结构并离线编译 SQL；在线配置测试使用替身连接，既有 PostgreSQL integration 测试仍只执行 `SELECT 1`。Stage 02C-2B 另行在独立 PostgreSQL 测试库完成了真实迁移和 17 组约束行为验证，使用 SAVEPOINT 处理预期异常并回滚所有测试数据；这项演练不属于每次 pytest 自动执行的测试。
 
 ## 本地验证记录
+
+### Stage 03A 验证
+
+2026-11-20，使用后端项目 `.venv` Python 3.11.6 实际执行：
+
+| 检查项 | 本轮实际结果 | 退出码 |
+| --- | --- | --- |
+| 安全模块 `tests/test_security.py` | 20 passed | 0 |
+| 注册 API `tests/test_registration.py` | 54 passed | 0 |
+| 全部非集成测试 | 152 passed，1 deselected | 0 |
+| 全量 pytest（含既有 PostgreSQL SELECT 1） | 153 passed，0 failed，0 skipped | 0 |
+| pip check | No broken requirements found. | 0 |
+
+新增 74 项测试，原有 79 项全部通过。测试进程限制 PostgreSQL 连接为只读，注册 API 测试额外阻止真实 PostgreSQL 连接；前后只读核对开发库与迁移演练库的版本、结构及空表状态保持一致。Stage 02C 的以下历史记录保持独立，不能替代本阶段测试。真实 PostgreSQL 注册写入与双连接并发验证未执行，需另行授权独立测试库。
 
 ### Stage 02C 最终状态与复验
 
