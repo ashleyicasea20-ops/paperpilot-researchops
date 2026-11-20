@@ -5,21 +5,22 @@ from datetime import datetime, timezone
 import json
 import sqlite3
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 from uuid import UUID, uuid4
 
 import httpx
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from pydantic import ValidationError
 import pytest
 from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError, TimeoutError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.security import verify_password
 from app.db.base import Base
-from app.db.session import get_db_session
+from app.db.session import REGISTRATION_COMMITTED, get_db_session
 from app.main import app
 from app.models import User
 from app.services import registration
@@ -76,9 +77,9 @@ def database():
     engine.dispose()
 
 
-def send(payload=None, *, method="POST", headers=None, content=None):
+def send(payload=None, *, method="POST", headers=None, content=None, asgi_app=app):
     async def perform():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=asgi_app), base_url="http://testserver") as client:
             return await client.request(method, PATH, json=payload if content is None else None,
                                         content=content, headers=headers)
     return asyncio.run(perform())
@@ -189,6 +190,25 @@ def test_registration_input_errors_are_sanitized(database, monkeypatch, caplog, 
     hasher.assert_not_called()
 
 
+def test_internal_json_parser_error_is_sanitized(database, monkeypatch, caplog):
+    caplog.set_level("DEBUG", logger="app")
+    marker = "synthetic-json-parser-failure"
+    parser = AsyncMock(side_effect=RuntimeError(marker))
+    hasher = Mock(side_effect=AssertionError("Hasher must not run"))
+    monkeypatch.setattr(Request, "json", parser)
+    monkeypatch.setattr(registration, "hash_password", hasher)
+
+    response = send({"email": "parser@example.com", "password": PASSWORD})
+
+    parser.assert_awaited_once()
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Registration failed"}
+    assert marker not in response.text + caplog.text
+    assert PASSWORD not in response.text + caplog.text
+    assert user_count(database) == 0
+    hasher.assert_not_called()
+
+
 def test_unrelated_http_400_keeps_status_and_headers(database):
     def rejected():
         raise HTTPException(400, "There was an error parsing the body", headers={"X-Test-Source": "dependency"})
@@ -197,6 +217,38 @@ def test_unrelated_http_400_keeps_status_and_headers(database):
     response = send({"email": "review@example.com", "password": PASSWORD})
     assert response.status_code == 400
     assert response.headers["X-Test-Source"] == "dependency"
+
+
+def test_explicit_http_400_with_cause_keeps_status_and_headers(database, caplog):
+    marker = "synthetic-explicit-http-cause"
+
+    def rejected():
+        try:
+            raise RuntimeError(marker)
+        except RuntimeError as cause:
+            raise StarletteHTTPException(
+                400,
+                "There was an error parsing the body",
+                headers={"X-Test-Source": "dependency"},
+            ) from cause
+
+    app.dependency_overrides[get_db_session] = rejected
+    response = send({"email": "review@example.com", "password": PASSWORD})
+    assert response.status_code == 400
+    assert response.json() == {"detail": "There was an error parsing the body"}
+    assert response.headers["X-Test-Source"] == "dependency"
+    assert marker not in response.text + caplog.text
+
+
+def test_explicit_http_429_keeps_retry_after(database):
+    def rejected():
+        raise HTTPException(429, "Too many requests", headers={"Retry-After": "3"})
+
+    app.dependency_overrides[get_db_session] = rejected
+    response = send({"email": "review@example.com", "password": PASSWORD})
+    assert response.status_code == 429
+    assert response.json() == {"detail": "Too many requests"}
+    assert response.headers["Retry-After"] == "3"
 
 
 def test_close_failure_after_real_commit_preserves_created_user(database, monkeypatch, caplog):
@@ -237,6 +289,68 @@ def test_close_failure_after_real_commit_preserves_created_user(database, monkey
     assert "Session cleanup failed after registration commit" in caplog.text
     assert marker not in response.text + caplog.text
     assert PASSWORD not in response.text + caplog.text
+
+
+def test_double_cleanup_failure_after_real_commit_sends_one_created_response(database, monkeypatch, caplog):
+    caplog.set_level("DEBUG", logger="app")
+    close_marker = "synthetic-close-error"
+    invalidate_marker = "synthetic-invalidate-error"
+    calls = []
+    response_starts = []
+
+    class CleanupFails(Session):
+        def commit(self):
+            super().commit()
+            calls.append("commit returned")
+
+        def close(self):
+            calls.append("close")
+            raise RuntimeError(close_marker)
+
+        def invalidate(self):
+            calls.append("invalidate")
+            raise RuntimeError(invalidate_marker)
+
+    async def observe_response(scope, receive, send_message):
+        async def observe_send(message):
+            if message["type"] == "http.response.start":
+                response_starts.append(message["status"])
+            await send_message(message)
+
+        await app(scope, receive, observe_send)
+
+    session = CleanupFails(database.engine)
+    app.dependency_overrides.pop(get_db_session)
+    monkeypatch.setattr("app.db.session.get_session_factory", lambda: lambda: session)
+    try:
+        response = send({"email": "double-cleanup@example.com", "password": PASSWORD}, asgi_app=observe_response)
+        assert calls == ["commit returned", "close", "invalidate"]
+        assert response.status_code == 201
+        assert response_starts == [201]
+        assert REGISTRATION_COMMITTED not in session.info
+        with Session(database.engine) as reader:
+            user = reader.scalars(select(User)).one()
+            assert response.json() == {
+                "id": str(user.id),
+                "email": user.email,
+                "is_active": user.is_active,
+                "created_at": user.created_at.isoformat(),
+                "updated_at": user.updated_at.isoformat(),
+            }
+            assert user.email == "double-cleanup@example.com"
+            assert user.password_hash not in response.text + caplog.text
+
+        warnings = [record for record in caplog.records if record.name == "app.db.session"]
+        assert [record.getMessage() for record in warnings] == [
+            "Session cleanup failed after registration commit",
+            "Session invalidation failed after registration commit",
+        ]
+        assert all(record.levelname == "WARNING" and record.exc_info is None for record in warnings)
+        for marker in (close_marker, invalidate_marker, PASSWORD):
+            assert marker not in response.text + caplog.text
+    finally:
+        # Release the test session explicitly after exercising both failures.
+        Session.close(session)
 
 
 def test_commit_exception_after_persistence_is_not_reported_as_success(database, monkeypatch, caplog):
