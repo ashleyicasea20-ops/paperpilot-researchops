@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app.api.v1.auth import router as auth_router
+from app.api.v1.login import router as login_router
 from app.db.session import DatabaseUnavailableError, check_database_connection
 
 DEFAULT_CORS_ORIGINS = "http://localhost:3000"
@@ -51,6 +52,7 @@ app.add_middleware(
 )
 
 app.include_router(auth_router)
+app.include_router(login_router)
 
 
 @app.get("/api/v1/health", response_model=HealthResponse, tags=["system"])

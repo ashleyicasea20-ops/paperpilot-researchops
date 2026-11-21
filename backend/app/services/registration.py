@@ -2,14 +2,11 @@
 
 import sqlite3
 
-from sqlalchemy.exc import (
-    DBAPIError, DisconnectionError, IntegrityError, InterfaceError,
-    OperationalError, TimeoutError,
-)
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.security import hash_password
-from app.db.session import DatabaseUnavailableError
+from app.db.session import is_database_unavailable
 from app.models import User
 from app.schemas.auth import RegisterRequest, UserResponse
 
@@ -26,13 +23,6 @@ class RegistrationUnavailable(Exception):
 
 class RegistrationFailed(Exception):
     """An unexpected internal registration failure."""
-
-
-def is_database_unavailable(error: Exception) -> bool:
-    return isinstance(error, (
-        DatabaseUnavailableError, OperationalError, InterfaceError,
-        DisconnectionError, TimeoutError,
-    )) or (isinstance(error, DBAPIError) and error.connection_invalidated)
 
 
 def is_email_conflict(error: IntegrityError, dialect: str) -> bool:

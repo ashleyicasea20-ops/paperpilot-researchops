@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from contextlib import contextmanager
 from functools import lru_cache
 import logging
 
 from pydantic import ValidationError
 from sqlalchemy import Engine, create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import (
+    DBAPIError, DisconnectionError, InterfaceError, OperationalError,
+    SQLAlchemyError, TimeoutError,
+)
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
@@ -19,6 +23,13 @@ REGISTRATION_COMMITTED = "paperpilot.registration_committed"
 
 class DatabaseUnavailableError(RuntimeError):
     """Raised when database configuration or connectivity is unavailable."""
+
+
+def is_database_unavailable(error: Exception) -> bool:
+    return isinstance(error, (
+        DatabaseUnavailableError, OperationalError, InterfaceError,
+        DisconnectionError, TimeoutError,
+    )) or (isinstance(error, DBAPIError) and error.connection_invalidated)
 
 
 @lru_cache
@@ -41,6 +52,33 @@ def get_session_factory() -> sessionmaker[Session]:
     """Create the application session factory."""
 
     return sessionmaker(bind=get_engine(), autoflush=False, expire_on_commit=False)
+
+
+@contextmanager
+def auth_read_session() -> Generator[Session, None, None]:
+    """Finish an authentication read before using its result."""
+    session = get_session_factory()()
+    operation_failed = False
+    try:
+        yield session
+    except BaseException:
+        operation_failed = True
+        try:
+            session.rollback()
+        except Exception:
+            logger.warning("Authentication session rollback failed")
+        raise
+    finally:
+        try:
+            session.close()
+        except Exception:
+            logger.warning("Authentication session close failed")
+            try:
+                session.invalidate()
+            except Exception:
+                logger.warning("Authentication session invalidation failed")
+            if not operation_failed:
+                raise
 
 
 def get_db_session() -> Generator[Session, None, None]:

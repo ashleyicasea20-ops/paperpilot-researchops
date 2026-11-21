@@ -10,16 +10,17 @@ PaperPilot ResearchOps 是面向 AI 科研工作流与实验智能管理的全�
 | Stage 02A | 完成：PostgreSQL 连接、Engine/Session、Settings 与 readiness |
 | Stage 02B | 完成：User、Workspace、WorkspaceMember ORM、约束及关系 |
 | Stage 02C | 完成：Alembic 初始迁移、独立测试库验证、本地开发库迁移和备份 |
-| Stage 03A | 已实现：用户注册、邮箱规范化、密码策略和 Argon2id 哈希；待人工验收 |
-| Stage 03B 及后续 | 待开发：登录、邮箱归属验证、认证、工作空间权限管理及租户隔离策略 |
+| Stage 03A | 已合并，提供用户注册、邮箱规范化、密码策略和 Argon2id 哈希 |
+| Stage 03B | 待人工审核，提供登录、短期 JWT Access Token 和当前用户查询 |
+| 后续阶段 | 邮箱归属验证、工作空间授权及租户隔离 |
 
-当前提供注册 API，但尚未实现登录、邮箱归属验证、认证、请求级授权或多租户安全隔离。注册成功不代表已经登录；ORM 关系和数据库约束不等同于访问控制。该接口不能单独视为生产就绪的完整认证系统。
+注册和登录是两次独立请求。当前认证范围是签发 Access Token 和查询当前账户，工作空间授权与多租户隔离留待后续阶段。
 
 ## 技术栈
 
 - Frontend: Next.js 16, React 19, TypeScript, Tailwind CSS 4, App Router
 - Backend: Python 3.11, FastAPI, Uvicorn, SQLAlchemy 2.x, Psycopg 3, Alembic 1.20.1
-- Registration: pwdlib[argon2] 0.4.2, email-validator 2.4.0
+- Authentication: pwdlib[argon2] 0.4.2, email-validator 2.4.0, PyJWT 2.15.1
 - Database: PostgreSQL 17
 - Testing: pytest, HTTPX / FastAPI TestClient
 
@@ -134,13 +135,56 @@ Invoke-RestMethod http://127.0.0.1:8000/api/v1/ready
 
 同步路由复用原有 Session 依赖。服务先添加并 flush 用户，取得服务器默认值并构造公开响应，再 commit；失败会尝试 rollback，依赖负责 close。最终去重由 `uq_users_email_lower` 唯一索引保证，不能用预查询代替。PostgreSQL 仅在 SQLSTATE 为 23505 且诊断名称为该索引时返回 409；其他约束或编程错误不会被当作重复邮箱。数据库连接及配置故障返回脱敏 503，其余内部错误返回通用 500。注册路由单独保护校验、依赖初始化和依赖清理路径，应用不记录密码、哈希或原始数据库错误；SQLAlchemy 参数已隐藏，外部日志和 APM 也应避免收集敏感请求体。
 
-CORS 保留原 Origin 白名单，允许 GET 与 POST，不启用跨域 Cookie。注册不创建 Token、登录会话、邮箱验证码或工作空间；目前也不提供登录、密码重置和权限 API。
+CORS 保留原 Origin 白名单，允许 GET 与 POST，跨域 Cookie 保持关闭。注册完成后，客户端可调用登录接口取得 Access Token。
 
 ### 注册测试与 PostgreSQL 隔离
 
 新增安全及 API 测试通过 `dependency_overrides` 注入独立内存 SQLite Session，启用外键，并在结束后关闭 Session、释放 Engine。新测试阻止真实 PostgreSQL 连接；既有 PostgreSQL integration 测试仍只有只读 `SELECT 1`。数据库约束及模拟的 PostgreSQL 诊断异常验证了去重路径，但不代表真实双连接并发注册已通过。
 
 未来 PostgreSQL 注册写入测试仅预留 `paperpilot_auth_test` 名称；本阶段不创建、迁移或写入该库，也没有默认启用的 PostgreSQL 注册写入测试。后续必须另行批准，显式 opt-in（例如 `PAPERPILOT_AUTH_PG_TESTS=1`），检查实际数据库、Schema 和 revision，并拒绝 `paperpilot_dev` 与 `paperpilot_migration_test`。应使用显式测试连接、外层事务和 SAVEPOINT，使服务内部 commit 仍可由外层 rollback 撤销；真正的双连接并发验证另行设计和授权。
+
+## 用户登录与当前账户（Stage 03B）
+
+在本机生成独立的 JWT 密钥。可用 Python 的 `secrets.token_hex(32)` 生成 32 个随机字节的 64 字符十六进制表示。将结果私下填入本机 `backend/.env` 的 `JWT_SECRET_KEY`，重启后端使其生效。应为不同环境使用不同密钥，并将实际值保存在 Git、共享终端输出和日志之外。认证接口在首次使用时验证密钥。缺失或无效的密钥会让认证失败，`/health`、`/ready` 和 Alembic 的配置仍独立加载。
+
+### 登录
+
+`POST /api/v1/auth/login` 接收 `Content-Type: application/json`。以下是虚构请求。
+
+```json
+{
+  "email": "researcher@example.com",
+  "password": "A-long-example-passphrase-2026"
+}
+```
+
+成功返回 HTTP 200 和 `Cache-Control: no-store`。
+
+```json
+{
+  "access_token": "<ACCESS_TOKEN>",
+  "token_type": "bearer",
+  "expires_in": 900
+}
+```
+
+登录沿用注册的邮箱规范化规则，使用 `lower(email)` 查询。密码原样送入 Argon2id，要求为非空字符串，最多 1024 个 UTF-8 字节，以兼容已有哈希。缺失或禁用的账户使用预计算的 Argon2id 哈希执行一次校验，以降低明显的响应耗时差异。数据库查询与不同哈希的成本仍可能产生时间差异。
+
+### 当前账户
+
+调用 `GET /api/v1/auth/me` 时传入 `Authorization: Bearer <ACCESS_TOKEN>`。服务固定使用 HS256、签发方 `paperpilot-researchops` 和受众 `paperpilot-api`。JWT 有效期为 900 秒，要求 `sub`、`iat`、`nbf`、`exp`、`iss`、`aud`、`token_type`，其中 `sub` 为用户 UUID，`token_type` 为 `access`。`/me` 先验证 Token，再按 UUID 读取数据库，仅向仍处于启用状态的用户返回与注册相同的公开字段。
+
+| 状态码 | 错误 detail |
+| --- | --- |
+| 登录 401 | `Invalid credentials`，用于邮箱不存在、密码错误和账户禁用 |
+| 当前账户 401 | `Invalid access token`，用于凭据缺失、无效、过期、用户不存在或已禁用 |
+| 登录 422 | `Invalid login input`，用于请求体解析或字段校验失败 |
+| 503 | `Authentication is unavailable` 或 `Database is unavailable` |
+| 500 | `Authentication failed`，用于未预期的认证、解析或 Session 清理错误 |
+
+两类 401 均含 `WWW-Authenticate: Bearer`。登录与当前账户接口只读取 PostgreSQL 用户数据。自动化测试使用合成密钥和内存 SQLite，通过依赖覆盖阻止连接真实 PostgreSQL，并使用 PyJWT 及 Argon2id 验证实际签发与验密。
+
+Refresh Token、主动注销、OAuth、密码重置、邮箱验证、工作空间授权和前端登录页面留待后续阶段。对外开放前需配置 HTTPS、请求大小上限、登录与注册限流及 Argon2 并发上限，确保代理和 APM 不记录密码、JWT 或 `Authorization` 头，并建立密钥轮换与认证事件监控流程。
 
 ## 启动前端
 
@@ -193,26 +237,34 @@ paperpilot-researchops/
 │   │   └── versions/20261120_0001_create_initial_tables.py
 │   ├── app/
 │   │   ├── __init__.py
+│   │   ├── api/request_errors.py
 │   │   ├── api/v1/auth.py      # 注册路由及脱敏边界
+│   │   ├── api/v1/login.py     # 登录和当前账户路由
 │   │   ├── core/config.py
 │   │   ├── core/security.py    # 密码策略和 Argon2id
+│   │   ├── core/token.py       # 签发与校验 Access Token
 │   │   ├── db/base.py
 │   │   ├── db/session.py
 │   │   ├── models/             # User、Workspace、WorkspaceMember
-│   │   ├── schemas/auth.py     # 注册输入与公开响应
+│   │   ├── schemas/auth.py     # 认证请求与公开响应
+│   │   ├── services/authentication.py
 │   │   ├── services/registration.py
 │   │   └── main.py
 │   ├── tests/
 │   │   ├── __init__.py
+│   │   ├── conftest.py
 │   │   ├── test_config.py
+│   │   ├── test_current_user.py
 │   │   ├── test_database_integration.py
 │   │   ├── test_database_reporting.py
 │   │   ├── test_health.py
+│   │   ├── test_login.py
 │   │   ├── test_models.py
 │   │   ├── test_migrations.py
 │   │   ├── test_registration.py
 │   │   ├── test_security.py
-│   │   └── test_readiness.py
+│   │   ├── test_readiness.py
+│   │   └── test_token.py
 │   ├── pytest.ini
 │   └── requirements.txt
 ├── docs/
@@ -242,7 +294,7 @@ paperpilot-researchops/
 
 ## 当前阶段边界
 
-Stage 02B 建立统一 Base.metadata、ORM 字段、关系、约束和离线测试。Stage 02C 已完成初始迁移，并在独立测试库及本地开发库应用 `20261120_0001`。Stage 03A 只增加注册服务，没有变更 Schema 或历史 revision。所有权仍只由 Workspace.owner_id 表示，成员角色仅限 admin/editor/viewer；登录、认证和请求级权限管理留待后续阶段。不包含前端注册页面、JWT、OAuth、Docker、Redis、云部署、研究 Agent 编排或大模型 API。
+Stage 02B 建立统一 Base.metadata、ORM 字段、关系、约束和离线测试。Stage 02C 已完成初始迁移，并在独立测试库及本地开发库应用 `20261120_0001`。Stage 03A 注册和 Stage 03B 登录均沿用该 Schema。所有权仍由 `Workspace.owner_id` 表示，成员角色仅限 admin/editor/viewer，工作空间操作的请求级授权留待后续阶段。前端认证页面、OAuth、Docker、Redis、云部署、研究 Agent 编排和大模型 API 均在当前范围之外。
 
 ## Alembic 迁移（Stage 02C 已完成）
 
