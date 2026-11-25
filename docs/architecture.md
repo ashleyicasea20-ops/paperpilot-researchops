@@ -2,7 +2,7 @@
 
 ## Stage 02C status: local database infrastructure complete
 
-Stage 01 completed the frontend/backend foundation. Stage 02A established synchronous PostgreSQL connectivity, Settings, session lifecycle management, and readiness. Stage 02B added User, Workspace, and WorkspaceMember ORM definitions. Stage 02C completed Alembic configuration and initial revision 20261120_0001, an isolated PostgreSQL restoration/migration rehearsal, and the explicitly approved migration of the local development database. The local public schema now contains users, workspaces, workspace_members, and alembic_version. The migration was scoped to local development. Stage 03A added registration and Stage 03B adds login and current-account authentication. Both use the existing schema. Email ownership verification, workspace authorization, and tenant isolation remain future work.
+Stage 01 completed the frontend/backend foundation. Stage 02A established synchronous PostgreSQL connectivity, Settings, session lifecycle management, and readiness. Stage 02B added User, Workspace, and WorkspaceMember ORM definitions. Stage 02C completed Alembic configuration and initial revision 20261120_0001, an isolated PostgreSQL restoration/migration rehearsal, and the explicitly approved migration of the local development database. The local public schema now contains users, workspaces, workspace_members, and alembic_version. The migration was scoped to local development. Stage 03A added registration, Stage 03B added login and current-account authentication, and Stage 03C-1 adds reusable identity and workspace authorization. These stages use the existing schema. Workspace APIs, mailbox verification, and resource-level tenant isolation remain future work.
 
 ## Runtime topology
 
@@ -40,11 +40,15 @@ The homepage is mostly a React Server Component. Only the health-status widget i
 - `backend/app/models/` owns identity, workspace ownership, and collaborator mappings.
 - `backend/app/api/v1/auth.py` owns the registration route and its validation/dependency error boundaries.
 - `backend/app/api/v1/login.py` owns the login and current-account routes and their separate error boundary.
+- `backend/app/api/dependencies.py` provides verified JWT subjects, current identities, and workspace permission dependencies.
+- `backend/app/api/protected_route.py` translates service errors into safe HTTP responses on opted-in routers.
 - `backend/app/schemas/auth.py` defines shared email validation, authentication input, token output, and the public user response.
 - `backend/app/core/security.py` owns password policy and reusable Argon2id hashing/verification primitives.
 - `backend/app/core/token.py` issues and verifies fixed-policy JWT access tokens.
+- `backend/app/core/authorization.py` owns the explicit role matrix and member-management policy.
 - `backend/app/services/registration.py` owns user creation, commit/rollback, and precise duplicate classification.
 - `backend/app/services/authentication.py` looks up stored users and verifies credentials through read-only queries.
+- `backend/app/services/workspace_access.py` resolves account and workspace access through a caller-owned Session.
 - `backend/alembic.ini` and `backend/alembic/` own migration configuration, the environment, the revision template, and immutable schema history.
 - `backend/tests/` owns API, model, configuration, and offline migration checks.
 - `docs/` records architecture decisions that apply across both runtimes.
@@ -107,6 +111,29 @@ Initial Stage 03B verification passed 240 non-integration tests, including 77 ne
 
 Refresh tokens, OAuth, logout revocation, mailbox verification, password recovery, workspace authorization, and tenant isolation are separate features. Before public deployment, configure HTTPS, request size limits, rate limits, Argon2 concurrency limits, and redaction in SQLAlchemy pool logs and at the proxy and APM layers. Use separately generated keys per environment and document key rotation and incident response. Replacing the current key invalidates tokens signed by the previous key after the new configuration is loaded.
 
+The remaining Stage 03B follow-up covers the classification of invalid Argon2 work parameters in stored hashes. Stage 03C-1 does not change password verification.
+
+### Stage 03C-1 workspace authorization
+
+Authentication establishes the current account. `TokenSubject` validates a single Bearer credential and extracts the signed UUID. `CurrentIdentity` additionally queries the active account and returns an immutable `AuthenticatedIdentity` containing only `user_id`. `/me` shares the token dependency and checks the active account while building the public profile.
+
+Authorization grants a specific operation for one workspace. `workspace_permission(Permission.WORKSPACE_READ)` can protect a route on `APIRouter(route_class=ProtectedRoute)` with a `workspace_id` path parameter. The dependency checks the current account and workspace within the same read Session, finishes cleanup, and returns an immutable `WorkspaceAccessContext` with `workspace_id`, `owner_id`, `user_id` and `effective_role`. The required permission is selected by the route. The subject comes from the verified Token, and a membership is selected by both workspace and user ID. Ownership uses `Workspace.owner_id` before membership lookup, including when the owner also has a membership row. Unknown membership roles fail closed. Contexts are server-side values with request or transaction scope. Role checks read the database on each request.
+
+| Permission | Owner | Admin | Editor | Viewer |
+| --- | --- | --- | --- | --- |
+| `workspace:read`, `resource:read`, `member:read` | Yes | Yes | Yes | Yes |
+| `resource:create`, `resource:update` | Yes | Yes | Yes | — |
+| `workspace:update`, `resource:delete`, `member:manage_basic` | Yes | Yes | — | — |
+| `workspace:delete`, `workspace:transfer`, `member:manage_admin` | Yes | — | — | — |
+
+`can_manage_member` checks the actual target ID, the stored role and proposed role. Owners may manage admin, editor and viewer members. Admins may add, update or remove editor and viewer members, with both roles required to satisfy the policy. The predicate rejects operations targeting the owner or the acting user, and rejects `owner` or unrecognized values as either ordinary member role. A missing role represents an absent membership or a removal, according to the operation. The caller must look up actual stored roles when using this policy. Resource and transfer permissions provide future policy entries. Workspace CRUD, membership writes, ownership transfer, and PDF isolation are outside this stage.
+
+`ProtectedRoute` supplies route-scoped, non-cacheable responses. Invalid authentication returns 401 with `WWW-Authenticate: Bearer`. An absent workspace and an inaccessible workspace both return 404 with `Workspace not found`. A user who has workspace access but lacks the operation permission receives 403. Database outages return 503, and unexpected failures return a sanitized 500. An authorization result is returned only after successful cleanup. An already determined rejection survives a cleanup fault under the existing read-session rules. Registration retains its own write-transaction and error handling.
+
+For written changes, `require_workspace_permission(session, subject, workspace_id, permission)` checks the active account and current authorization using the supplied business transaction. Pass the verified `TokenSubject`; the caller owns Session lifetime and commit. Authorization queries suppress autoflush. A standalone read dependency gives a point-in-time result, and account, ownership and membership can change afterward. Future writers must recheck within their business transaction and choose locking or conditional writes appropriate to the mutation. Stage 03C-1 provides neither transaction-level revocation guarantees nor workspace-scoped conditions for future resource queries.
+
+Tests run permission and member-policy checks in Python and exercise authorization through a separate FastAPI app, in-memory SQLite and synthetic JWTs. They cover cross-workspace role differences, immediate role changes on subsequent requests, input spoofing, fail-closed role handling and Session errors. Stage 03C-1 passed 389 non-integration tests, including 132 new cases. The existing PostgreSQL integration test was excluded, and the authentication fixture blocks PostgreSQL connections. Native PostgreSQL transaction and cross-user concurrency tests require separate authorization.
+
 ## Configuration and security
 
 - The frontend reads `NEXT_PUBLIC_API_BASE_URL`; the `NEXT_PUBLIC_` prefix means the value is intentionally visible in the browser bundle.
@@ -129,7 +156,7 @@ Readiness unit tests mock the connectivity function to exercise HTTP 200 and 503
 
 Integration failures report only the exception type and a generic diagnostic message. Driver/configuration exceptions are caught before calling `pytest.fail(..., pytrace=False)` outside the exception handler, preventing pytest from expanding credential-bearing driver frames or chained exception context. Unit regressions cover both driver and settings failures. Connection failures remain failures, rather than being silently skipped.
 
-Stage 02B model tests use an isolated `sqlite+pysqlite:///:memory:` engine with `PRAGMA foreign_keys=ON`. Only that fixture creates tables with `Base.metadata.create_all(engine)`; it closes/disposes the in-memory database afterward. No application startup code, model import, or PostgreSQL integration test runs schema DDL. Model tests do not load local credentials. PostgreSQL DDL is compiled offline, including expression indexes and named constraints; the real integration test remains the existing read-only `SELECT 1`.
+Stage 02B model tests use an isolated `sqlite+pysqlite:///:memory:` engine with `PRAGMA foreign_keys=ON`. Test fixtures create tables on their isolated in-memory Engines and dispose them afterward. No application startup code, model import, or PostgreSQL integration test runs schema DDL. Model tests do not load local credentials. PostgreSQL DDL is compiled offline, including expression indexes and named constraints; the real integration test remains the existing read-only `SELECT 1`.
 
 SQLite exercises basic constraints and ORM cascades, but it is not a PostgreSQL compatibility proof: its default `lower()` only handles ASCII case, `VARCHAR(n)` does not enforce PostgreSQL's length limit, UUIDs are stored as hex text, timezone-aware timestamp storage differs, and transaction/concurrency behavior differs. Stage 02C-2B separately exercised the real initial migration and 17 groups of native constraint behavior in the isolated PostgreSQL test database. Expected IntegrityError cases used SAVEPOINTs and all synthetic business data was rolled back. That rehearsal is separate from the repository's 79 pytest cases and is not automatically repeated by pytest. Future revisions require their own reviewed migration and recovery validation.
 
@@ -151,13 +178,13 @@ The unique email index provides database protection against case variants accord
 
 ## Ownership, relationships, and deletion
 
-`Workspace.owner_id` is the unique authoritative ownership source. An owner does not need a membership row, and deleting or losing a membership cannot change ownership. `owner` is not a legal member role; the future authorization layer must always give the owner highest workspace permissions. WorkspaceMember records ordinary collaborators with admin/editor/viewer roles and defaults to viewer.
+`Workspace.owner_id` is the unique authoritative ownership source. An owner does not need a membership row, and deleting or losing a membership cannot change ownership. The resolver grants `owner` only from `Workspace.owner_id`. WorkspaceMember records ordinary collaborators with admin/editor/viewer roles and defaults to viewer.
 
 Relationships use explicit `back_populates`: User.owned_workspaces ↔ Workspace.owner, User.workspace_memberships ↔ WorkspaceMember.user, and Workspace.memberships ↔ WorkspaceMember.workspace. There are no overlapping direct many-to-many shortcuts. A user may own many workspaces, including several with the same name.
 
 Deleting a user who still owns a workspace is rejected by the owner FK's `ON DELETE RESTRICT`. User.owned_workspaces uses `passive_deletes="all"` with no delete cascade so ORM deletion does not null out owner IDs or delete owned workspaces, even when that relationship is loaded. Workspace and ordinary user deletion remove associated membership rows using `ON DELETE CASCADE`; membership collections also use ORM delete-orphan cascade and passive deletion for unloaded collections.
 
-Database constraints guarantee references, non-null/nonblank values, email uniqueness under the stated case rules, valid member roles, unique member pairs, and the deletion policies. They do not verify the caller, account activation, access to a supplied workspace ID, role-specific actions, ownership transfer, or whether an owner has also been inserted as an ordinary member. Stage 03 must prevent redundant owner membership in its service layer and authorize every workspace operation using the authenticated user plus `owner_id` **or** an effective membership. A workspace ID supplied by the frontend is never sufficient authority. No permission API, authentication middleware, or database row-level security is implemented in this stage.
+Database constraints guarantee references, non-null/nonblank values, email uniqueness under the stated case rules, valid member roles, unique member pairs, and the deletion policies. Request authorization also checks the active account, workspace linkage and required permission. Future member-writing services must prevent redundant owner membership. Future workspace and resource endpoints must scope each query or mutation to the authorized workspace. Database row-level security remains outside this stage.
 
 ## Timestamp behavior
 
@@ -165,7 +192,7 @@ User and Workspace share non-null `created_at` and `updated_at`; WorkspaceMember
 
 ## Intended growth path
 
-Future capabilities should be added behind tested service boundaries. Stage 02C applied the initial schema to the validated local development environment. Stage 03A implements registration, input normalization, and password hashing. Stage 03B verifies identity at `/me`; future workspace endpoints must use that identity to enforce owner and membership policies. Mailbox verification, workspace authorization, and tenant isolation remain separate milestones.
+Future capabilities should be added behind tested service boundaries. Stage 02C applied the initial schema to the validated local development environment. Stage 03A implements registration, input normalization, and password hashing. Stage 03B verifies identity at `/me`. Stage 03C-1 resolves current workspace roles and permissions. Workspace routes must apply these checks when they are added. Mailbox verification and resource-level tenant isolation remain separate milestones.
 
 ## Alembic configuration and version history
 
