@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
@@ -63,6 +64,13 @@ def auth_client(auth_database):
         return asyncio.run(request())
 
     return SimpleNamespace(get=partial(send, "GET"), post=partial(send, "POST"), options=partial(send, "OPTIONS"))
+
+
+@pytest.fixture
+def protected_app(auth_database, auth_settings):
+    api = FastAPI()
+    api.dependency_overrides[get_auth_settings] = lambda: auth_settings
+    return api
 
 
 @pytest.fixture(scope="session")

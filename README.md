@@ -11,10 +11,11 @@ PaperPilot ResearchOps 是面向 AI 科研工作流与实验智能管理的全�
 | Stage 02B | 完成：User、Workspace、WorkspaceMember ORM、约束及关系 |
 | Stage 02C | 完成：Alembic 初始迁移、独立测试库验证、本地开发库迁移和备份 |
 | Stage 03A | 已合并，提供用户注册、邮箱规范化、密码策略和 Argon2id 哈希 |
-| Stage 03B | 待人工审核，提供登录、短期 JWT Access Token 和当前用户查询 |
-| 后续阶段 | 邮箱归属验证、工作空间授权及租户隔离 |
+| Stage 03B | 已合并，提供登录、短期 JWT Access Token 和当前用户查询 |
+| Stage 03C-1 | 待独立审查，提供可复用身份依赖和工作空间 RBAC |
+| 后续阶段 | 工作空间 CRUD、成员管理、邮箱归属验证和资源隔离 |
 
-注册和登录是两次独立请求。当前认证范围是签发 Access Token 和查询当前账户，工作空间授权与多租户隔离留待后续阶段。
+注册和登录是两次独立请求。后端已提供工作空间授权基础，正式工作空间及资源接口将在后续接入。
 
 ## 技术栈
 
@@ -186,6 +187,25 @@ CORS 保留原 Origin 白名单，允许 GET 与 POST，跨域 Cookie 保持关�
 
 Refresh Token、主动注销、OAuth、密码重置、邮箱验证、工作空间授权和前端登录页面留待后续阶段。对外开放前需配置 HTTPS、请求大小上限、登录与注册限流及 Argon2 并发上限，确保代理和 APM 不记录密码、JWT 或 `Authorization` 头，并建立密钥轮换与认证事件监控流程。
 
+## 工作空间授权基础（Stage 03C-1）
+
+身份认证确认 Bearer Token 对应的当前启用用户。授权根据这名用户在目标工作空间的当前角色，判断是否允许执行路由要求的权限。
+
+`CurrentIdentity` 返回不可变的 `user_id`。`workspace_permission(...)` 在一个只读 Session 中检查账户状态和目标工作空间，生成不可变的 `WorkspaceAccessContext`，包含 `workspace_id`、`owner_id`、`user_id` 和 `effective_role`。所有权以 `Workspace.owner_id` 为准。其他用户的成员记录按工作空间与用户 UUID 共同查找，角色变化在后续请求中生效。
+
+| 权限 | Owner | Admin | Editor | Viewer |
+| --- | --- | --- | --- | --- |
+| `workspace:read`、`resource:read`、`member:read` | ✓ | ✓ | ✓ | ✓ |
+| `resource:create`、`resource:update` | ✓ | ✓ | ✓ | — |
+| `workspace:update`、`resource:delete`、`member:manage_basic` | ✓ | ✓ | — | — |
+| `workspace:delete`、`workspace:transfer`、`member:manage_admin` | ✓ | — | — | — |
+
+未知角色和权限默认拒绝。Owner 可以管理 admin、editor、viewer，Admin 只能管理 editor、viewer。成员管理同时检查目标现有角色和拟设置角色，拒绝管理所有者或自行改权，成员角色不能设置为 `owner`。
+
+认证缺失、无效或账户已禁用返回 401 并携带 `WWW-Authenticate: Bearer`。工作空间不存在、用户没有成员关系或角色无效统一返回 404。已有访问资格但缺少操作权限返回 403。数据库不可用返回脱敏 503，其他故障返回通用 500。
+
+本阶段交付身份依赖、权限策略和工作空间访问判定。端到端测试使用独立测试路由、内存 SQLite 和合成账户。Workspace CRUD、成员管理、所有权转移及 PDF 资源隔离由后续阶段接入。写操作需要在实际业务事务中使用同一个 Session 重新授权，并按操作设计权限撤销与并发控制。
+
 ## 启动前端
 
 在另一个 PowerShell 终端中：
@@ -237,9 +257,12 @@ paperpilot-researchops/
 │   │   └── versions/20261120_0001_create_initial_tables.py
 │   ├── app/
 │   │   ├── __init__.py
+│   │   ├── api/dependencies.py
+│   │   ├── api/protected_route.py
 │   │   ├── api/request_errors.py
 │   │   ├── api/v1/auth.py      # 注册路由及脱敏边界
 │   │   ├── api/v1/login.py     # 登录和当前账户路由
+│   │   ├── core/authorization.py
 │   │   ├── core/config.py
 │   │   ├── core/security.py    # 密码策略和 Argon2id
 │   │   ├── core/token.py       # 签发与校验 Access Token
@@ -249,10 +272,12 @@ paperpilot-researchops/
 │   │   ├── schemas/auth.py     # 认证请求与公开响应
 │   │   ├── services/authentication.py
 │   │   ├── services/registration.py
+│   │   ├── services/workspace_access.py
 │   │   └── main.py
 │   ├── tests/
 │   │   ├── __init__.py
 │   │   ├── conftest.py
+│   │   ├── test_auth_dependencies.py
 │   │   ├── test_config.py
 │   │   ├── test_current_user.py
 │   │   ├── test_database_integration.py
@@ -260,11 +285,13 @@ paperpilot-researchops/
 │   │   ├── test_health.py
 │   │   ├── test_login.py
 │   │   ├── test_models.py
+│   │   ├── test_rbac.py
 │   │   ├── test_migrations.py
 │   │   ├── test_registration.py
 │   │   ├── test_security.py
 │   │   ├── test_readiness.py
-│   │   └── test_token.py
+│   │   ├── test_token.py
+│   │   └── test_workspace_access.py
 │   ├── pytest.ini
 │   └── requirements.txt
 ├── docs/
@@ -294,7 +321,7 @@ paperpilot-researchops/
 
 ## 当前阶段边界
 
-Stage 02B 建立统一 Base.metadata、ORM 字段、关系、约束和离线测试。Stage 02C 已完成初始迁移，并在独立测试库及本地开发库应用 `20261120_0001`。Stage 03A 注册和 Stage 03B 登录均沿用该 Schema。所有权仍由 `Workspace.owner_id` 表示，成员角色仅限 admin/editor/viewer，工作空间操作的请求级授权留待后续阶段。前端认证页面、OAuth、Docker、Redis、云部署、研究 Agent 编排和大模型 API 均在当前范围之外。
+Stage 02B 建立统一 Base.metadata、ORM 字段、关系、约束和离线测试。Stage 02C 已完成初始迁移，并在独立测试库及本地开发库应用 `20261120_0001`。Stage 03A 注册、Stage 03B 登录和 Stage 03C-1 权限判定均沿用该 Schema。Stage 03C-2 将权限检查接入正式工作空间路由。前端认证页面、OAuth、Docker、Redis、云部署、研究 Agent 编排和大模型 API 均在当前范围之外。
 
 ## Alembic 迁移（Stage 02C 已完成）
 

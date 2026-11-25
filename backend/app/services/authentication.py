@@ -1,5 +1,6 @@
 """Read existing users and verify credentials without database writes."""
 
+from dataclasses import dataclass
 import logging
 from uuid import UUID
 
@@ -10,6 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.security import verify_password
+from app.core.token import InvalidAccessToken
 from app.db.session import auth_read_session
 from app.models import User
 from app.schemas.auth import LoginRequest
@@ -36,6 +38,11 @@ INVALID_ARGON2_ENCODING_ERRORS = frozenset(error_to_str(code) for code in (
 
 class InvalidCredentials(Exception):
     """The supplied identity cannot authenticate an active user."""
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedIdentity:
+    user_id: UUID
 
 
 def _verify_stored_password(password: str, encoded_hash: str) -> bool:
@@ -71,6 +78,17 @@ def authenticate_user(request: LoginRequest) -> UUID:
     return credentials.id
 
 
+def _active_account(user_id: UUID):
+    return User.id == user_id, User.is_active.is_(True)
+
+
+def require_active_identity(session: Session, subject: UUID) -> AuthenticatedIdentity:
+    with session.no_autoflush:
+        user_id = session.scalar(select(User.id).where(*_active_account(subject)))
+    if user_id is None:
+        raise InvalidAccessToken
+    return AuthenticatedIdentity(user_id)
+
+
 def get_active_user(session: Session, user_id: UUID) -> User | None:
-    user = session.get(User, user_id)
-    return user if user is not None and user.is_active else None
+    return session.scalar(select(User).where(*_active_account(user_id)))
