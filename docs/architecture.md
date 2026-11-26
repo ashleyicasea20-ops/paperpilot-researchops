@@ -2,7 +2,7 @@
 
 ## Stage 02C status: local database infrastructure complete
 
-Stage 01 completed the frontend/backend foundation. Stage 02A established synchronous PostgreSQL connectivity, Settings, session lifecycle management, and readiness. Stage 02B added User, Workspace, and WorkspaceMember ORM definitions. Stage 02C completed Alembic configuration and initial revision 20261120_0001, an isolated PostgreSQL restoration/migration rehearsal, and the explicitly approved migration of the local development database. The local public schema now contains users, workspaces, workspace_members, and alembic_version. The migration was scoped to local development. Stage 03A added registration, Stage 03B added login and current-account authentication, and Stage 03C-1 adds reusable identity and workspace authorization. These stages use the existing schema. Workspace APIs, mailbox verification, and resource-level tenant isolation remain future work.
+Stage 01 completed the frontend/backend foundation. Stage 02A established synchronous PostgreSQL connectivity, Settings, session lifecycle management, and readiness. Stage 02B added User, Workspace, and WorkspaceMember ORM definitions. Stage 02C completed Alembic configuration and initial revision 20261120_0001 and recorded an approved local migration and isolated rehearsal. Stage 03A added registration, Stage 03B added login, Stage 03C-1 added identity/RBAC, and Stage 03C-2 adds production Workspace CRUD using that same schema. Stage 03C-2 does not inspect or mutate the actual PostgreSQL environment. Member/ownership management APIs, mailbox verification and PDF/resource isolation remain future work.
 
 ## Runtime topology
 
@@ -134,6 +134,62 @@ For written changes, `require_workspace_permission(session, subject, workspace_i
 
 Tests run permission and member-policy checks in Python and exercise authorization through a separate FastAPI app, in-memory SQLite and synthetic JWTs. They cover cross-workspace role differences, immediate role changes on subsequent requests, input spoofing, fail-closed role handling and Session errors. Stage 03C-1 passed 389 non-integration tests, including 132 new cases. The existing PostgreSQL integration test was excluded, and the authentication fixture blocks PostgreSQL connections. Native PostgreSQL transaction and cross-user concurrency tests require separate authorization.
 
+### Stage 03C-2 production Workspace APIs
+
+`backend/app/api/v1/workspaces.py` registers five production operations through a small ProtectedRoute subclass. `TokenSubject` verifies the credential; the service rechecks the active account and authorization rather than trusting client user IDs, JWT roles or a previous read dependency. The existing role matrix is unchanged.
+
+| Endpoint | Authorization | Response |
+| --- | --- | --- |
+| POST `/api/v1/workspaces` | Active account; server assigns ownership | 201 WorkspaceResponse |
+| GET `/api/v1/workspaces` | Active account; SQL-filtered owner/valid memberships | 200 WorkspaceListResponse |
+| GET `/api/v1/workspaces/{workspace_id}` | workspace:read | 200 WorkspaceResponse |
+| PATCH `/api/v1/workspaces/{workspace_id}` | workspace:update; owner/admin | 200 WorkspaceResponse |
+| DELETE `/api/v1/workspaces/{workspace_id}` | workspace:delete; owner only | 204, empty body |
+
+Create/update accept exactly one required strict string field `name`, length 1–150. Unicode whitespace-only strings, NUL, malformed Unicode, unknown fields and empty PATCH bodies are rejected. Valid whitespace around a nonblank name is preserved. Output is constructed from an explicit whitelist: id, name, owner_id, created_at, updated_at, effective_role. No ORM entity, password/hash, member profile or credential is serialized. Creating a workspace does not insert an owner membership.
+
+Scoped reads outer-join only the caller's membership and filter ownership OR admin/editor/viewer in SQL. The composite membership key prevents duplicate joins; owner role takes precedence. Details also apply the scope predicate to their data query, after the shared permission check. Lists default to limit=20/offset=0, require limit 1–100 and offset 0–9223372036854775807 (2**63-1), sort ascending by created_at/id, and count only the same scoped query. The route and response schema share MAX_OFFSET. Invalid offsets receive a redacted 422 before a database Session or SQL query is started. Count and page statements are not a frozen pagination snapshot under concurrent changes. Reads are point-in-time checks, not transaction-level revocation guarantees.
+
+Errors preserve the existing 401/403/404/422/503/500 policy. Inaccessible and missing spaces have the same 404 body. Workspace input/internal errors use fixed details. All protected responses carry no-store; the shared boundary now also covers method-not-allowed while preserving HTTPException headers such as Allow. CORS adds PATCH/DELETE to GET/POST without changing origins or enabling credentials.
+
+### Workspace writes and the PostgreSQL locking protocol
+
+`backend/app/db/workspace_session.py` exclusively owns each Workspace write Session, begin, commit, rollback and close. It is separate from registration, never uses REGISTRATION_COMMITTED and does not change auth_read_session. PostgreSQL connections explicitly request READ COMMITTED before the first statement and apply SET LOCAL lock_timeout='5s' and statement_timeout='15s'. Connection options reset on return to the pool. SQLite ignores the row-lock clauses and cannot validate this concurrency protocol.
+
+The service locks the actor's User row FOR SHARE, then checks active status. PATCH/DELETE lock the Workspace row FOR UPDATE, then the actor's existing membership row FOR UPDATE, then call require_workspace_permission with that same Session. Scalar authorization queries read persisted values without autoflush/identity-map shortcuts. POST locks/rechecks the account and creates a workspace owned by that verified UUID. Pending business changes must be explicitly flushed before any authorization that is intended to observe them.
+
+The intended serialization points are:
+
+- If disable/remove/downgrade/transfer commits before the relevant lock is acquired, the subsequent READ COMMITTED authorization must observe it and deny as appropriate.
+- If this writer acquires its locks first, an account UPDATE/DELETE, Workspace ownership UPDATE/DELETE, or existing membership UPDATE/DELETE needs a conflicting lock and must wait for this writer's transaction to finish. This orders the operations; it is not retroactive cancellation of an already authorized transaction.
+- Concurrent Workspace mutations serialize on the Workspace row. Missing memberships do not receive a gap lock: a denied nonmember transaction performs no write. Ownership is read while the Workspace lock is held.
+
+Future member-management, transfer and multi-entity transactions must use a shared order: all required User rows in UUID order, then all Workspace rows in UUID order, then membership rows in user UUID order. Lock actor/target users before Workspace; never lock a member then wait for its Workspace, or upgrade a User lock after acquiring Workspace. Account-management code touching workspaces must follow the same protocol. A writer holding a member lock and then requesting Workspace can deadlock with Workspace deletion/cascade; mixed orders are forbidden. Deadlock, serialization and timeout errors are not automatically retried. The lock/statement timeouts bound individual PostgreSQL waits, not the whole HTTP request duration.
+
+These are implemented PostgreSQL-compatible statements and protocol assumptions, not native execution evidence. Real two-connection tests must separately verify account disable, downgrade/removal, transfer, concurrent deletion, waits, deadlocks and commit acknowledgement loss in an explicitly approved isolated database. No PostgreSQL connection was made for Stage 03C-2 development.
+
+### Workspace commit and cleanup outcomes
+
+Writes flush/refresh data and validate a public DTO before commit. The transaction manager performs an explicit final flush before entering the commit phase. Operation or explicit flush failures occur before commit is called, attempt rollback, and retain the original redacted error classification. This includes database-confirmed DML/constraint rejection before commit. Only a normal return from commit acknowledges success and permits 201/200/204. Post-acknowledgement cleanup faults log only fixed warnings and retain the actual success result. Rollback/close failures never replace a primary rejection or UNKNOWN result. Close falls back to Session.invalidate, then retained Connection.invalidate/close with no unbounded retries. The application cannot force physical release if every underlying driver cleanup operation is broken; this terminal condition needs operational intervention.
+
+Once Session.commit() starts, any ordinary exception is conservatively COMMIT UNKNOWN, reported as a redacted 503 with `Workspace commit outcome is unknown; reconcile before retrying`. This manager does not collect reliable evidence identifying a rejection from the main physical commit. IntegrityError, OperationalError or SQLSTATE 40001/40P01 alone cannot supply that evidence: an after_commit callback may raise the same error after data is durable. A before_commit callback can also add pending changes that fail in commit's implicit flush; that non-applied outcome is still UNKNOWN to this manager. Classification uses the manager's own pre-commit/commit control flow, not SQLAlchemy private attributes, Session.is_active, in_transaction() or connection closure as proof of physical outcome.
+
+The original UNKNOWN exception context is discarded. No automatic retry or claim of successful rollback is made: a server commit may already have happened, and rollback cannot undo it. If commit returned normally, later Session.close failure preserves acknowledged success. Tests distinguish actual database state from what the application can prove by querying a separate Session after each fault. Clients must reconcile the current state before retrying POST/PATCH/DELETE; names are not unique, and no idempotency-key facility is claimed.
+
+### Workspace test and deletion boundaries
+
+The shared auth fixture now explicitly enables SQLite foreign keys. New Workspace fixtures use a unique SQLite shared-memory URI and independent keeper connection, so invalidating the single pooled connection does not erase the database and conceal cleanup/commit outcomes. They retain one pooled connection, enable foreign keys on every checkout-created connection, and assert no checked-out connections at teardown. Real PostgreSQL calls are blocked and synthetic credentials are used.
+
+Tests exercise the production ASGI app, six isolated users, role filtering, pagination, invalid inputs, downgraded/removed/deleted users, error redaction, acknowledged/unknown/rejected commits, rollback and multiple cleanup failures. Offline PostgreSQL compilation checks the actual lock statement order and mocks inspect transaction options; neither proves native row-lock behavior. Existing authentication/RBAC tests are retained.
+
+Deletion relies on the existing WorkspaceMember CASCADE foreign keys and never deletes User records. SQLite tests assert memberships disappear, users and other spaces remain, failure rolls data back, and 204 has no body. Future PDF/experiment tables and external object storage require a separately designed transactional relationship, deletion/retention policy and recoverable external cleanup (for example a reviewed durable cleanup workflow); current Workspace deletion is not proof of future file deletion consistency. No member-writing, ownership-transfer, PDF, RAG, Agent or deployment features are introduced here.
+
+The initial 2026-11-25 development baseline was 566 non-integration cases with one integration case deselected. The first independent review then reproduced commit-classification and offset-overflow failures. On 2026-11-26, 42 new targeted regression cases ran against the original implementation: 25 failed and 17 passed. The implementation fix made all 42 pass; three additional cases cover database rejection combined with rollback/close failures, for 45 added cases in this repair.
+
+Final Python 3.11.6 results are 36 commit-focused cases, 9 offset cases, 89 transaction cases, 78 CRUD cases, 55 isolation cases, 311 existing authentication/RBAC cases, and 611 non-integration cases overall with one integration case deselected. Final commands, pip check and git diff --check exited 0, with no final failures or skips. New after_commit tests exercise POST/PATCH/DELETE with IntegrityError, OperationalError carrying 40001/40P01, and RuntimeError, with and without cleanup faults. They record the callback phase and the same exception propagating from the real Session.commit(), assert one commit/one HTTP response, and independently verify durable data. SQLite-only triggers provide actual pre-commit database rejection; offset tests verify 0, 1, the int64 maximum and invalid inputs without opening a database Session.
+
+Test processes block real .env reads and Psycopg connections. No real PostgreSQL network interruption, row-lock contention, concurrency, migration or Workspace writes were exercised. SQLite fault injection and offline compilation are not native PostgreSQL evidence. These repair results await a second independent Stage 03C-2 review.
+
 ## Configuration and security
 
 - The frontend reads `NEXT_PUBLIC_API_BASE_URL`; the `NEXT_PUBLIC_` prefix means the value is intentionally visible in the browser bundle.
@@ -192,7 +248,7 @@ User and Workspace share non-null `created_at` and `updated_at`; WorkspaceMember
 
 ## Intended growth path
 
-Future capabilities should be added behind tested service boundaries. Stage 02C applied the initial schema to the validated local development environment. Stage 03A implements registration, input normalization, and password hashing. Stage 03B verifies identity at `/me`. Stage 03C-1 resolves current workspace roles and permissions. Workspace routes must apply these checks when they are added. Mailbox verification and resource-level tenant isolation remain separate milestones.
+Future capabilities should be added behind tested service boundaries. Stage 02C applied the initial schema to the validated local development environment. Stage 03A implements registration, input normalization, and password hashing. Stage 03B verifies identity at `/me`. Stage 03C-1 resolves current workspace roles and permissions, and Stage 03C-2 applies these checks to production Workspace CRUD. Member/ownership management, mailbox verification and PDF/resource tenant isolation remain separate milestones.
 
 ## Alembic configuration and version history
 

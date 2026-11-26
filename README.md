@@ -12,10 +12,11 @@ PaperPilot ResearchOps 是面向 AI 科研工作流与实验智能管理的全�
 | Stage 02C | 完成：Alembic 初始迁移、独立测试库验证、本地开发库迁移和备份 |
 | Stage 03A | 已合并，提供用户注册、邮箱规范化、密码策略和 Argon2id 哈希 |
 | Stage 03B | 已合并，提供登录、短期 JWT Access Token 和当前用户查询 |
-| Stage 03C-1 | 待独立审查，提供可复用身份依赖和工作空间 RBAC |
-| 后续阶段 | 工作空间 CRUD、成员管理、邮箱归属验证和资源隔离 |
+| Stage 03C-1 | 已合并：可复用身份依赖和工作空间 RBAC |
+| Stage 03C-2 | Workspace CRUD、分页隔离与写事务保护已实现，等待独立代码审查；PostgreSQL 并发验证尚未执行 |
+| 后续阶段 | 成员管理、邮箱归属验证、PDF 文献与资源隔离 |
 
-注册和登录是两次独立请求。后端已提供工作空间授权基础，正式工作空间及资源接口将在后续接入。
+注册和登录是两次独立请求。后端已接入正式 Workspace CRUD；成员管理和 PDF 资源接口尚未实现。
 
 ## 技术栈
 
@@ -185,7 +186,7 @@ CORS 保留原 Origin 白名单，允许 GET 与 POST，跨域 Cookie 保持关�
 
 两类 401 均含 `WWW-Authenticate: Bearer`。登录与当前账户接口只读取 PostgreSQL 用户数据。自动化测试使用合成密钥和内存 SQLite，通过依赖覆盖阻止连接真实 PostgreSQL，并使用 PyJWT 及 Argon2id 验证实际签发与验密。
 
-Refresh Token、主动注销、OAuth、密码重置、邮箱验证、工作空间授权和前端登录页面留待后续阶段。对外开放前需配置 HTTPS、请求大小上限、登录与注册限流及 Argon2 并发上限，确保代理和 APM 不记录密码、JWT 或 `Authorization` 头，并建立密钥轮换与认证事件监控流程。
+Refresh Token、主动注销、OAuth、密码重置、邮箱验证和前端登录页面留待后续阶段。对外开放前需配置 HTTPS、请求大小上限、登录与注册限流及 Argon2 并发上限，确保代理和 APM 不记录密码、JWT 或 `Authorization` 头，并建立密钥轮换与认证事件监控流程。
 
 ## 工作空间授权基础（Stage 03C-1）
 
@@ -205,6 +206,46 @@ Refresh Token、主动注销、OAuth、密码重置、邮箱验证、工作空�
 认证缺失、无效或账户已禁用返回 401 并携带 `WWW-Authenticate: Bearer`。工作空间不存在、用户没有成员关系或角色无效统一返回 404。已有访问资格但缺少操作权限返回 403。数据库不可用返回脱敏 503，其他故障返回通用 500。
 
 本阶段交付身份依赖、权限策略和工作空间访问判定。端到端测试使用独立测试路由、内存 SQLite 和合成账户。Workspace CRUD、成员管理、所有权转移及 PDF 资源隔离由后续阶段接入。写操作需要在实际业务事务中使用同一个 Session 重新授权，并按操作设计权限撤销与并发控制。
+
+## 工作空间 API（Stage 03C-2）
+
+五个接口均注册在正式应用中，使用 `Authorization: Bearer <ACCESS_TOKEN>`；账户必须仍然启用。当前前端尚无 Workspace 页面。所有权唯一来源是 `Workspace.owner_id`；普通成员角色仍只允许 admin/editor/viewer，不创建 owner 成员记录。
+
+| 方法与路径 | 权限 | 成功响应 |
+| --- | --- | --- |
+| `POST /api/v1/workspaces` | 启用账户 | 201，创建者为 Owner |
+| `GET /api/v1/workspaces` | 启用账户，只列出可访问空间 | 200，items/total/limit/offset |
+| `GET /api/v1/workspaces/{workspace_id}` | Owner / Admin / Editor / Viewer | 200，单个空间 |
+| `PATCH /api/v1/workspaces/{workspace_id}` | Owner / Admin | 200，更新后的空间 |
+| `DELETE /api/v1/workspaces/{workspace_id}` | 仅 Owner | 204，无正文 |
+
+创建和修改请求都只接受 `{"name":"Solar Forecasting Research"}`。name 必须是 1–150 个字符的字符串，拒绝纯 Unicode 空白、NUL 和非法 Unicode；保留合法输入的首尾空白，不自动规范化名称。禁止额外字段，包括 owner_id、user_id、role、effective_role、id 和 timestamps；空 PATCH 同样返回 422。
+
+单个空间的公开字段固定为 id、name、owner_id、created_at、updated_at、effective_role。列表默认 `limit=20&offset=0`，limit 为 1–100，offset 范围为 `0–9223372036854775807`（`2**63-1`）。越界、负数和非整数 offset 在访问数据库前返回脱敏 422；上限值可正常查询并在当前测试数据规模下返回空列表。SQL 按当前用户的所有权或合法成员关系过滤，并按 created_at、id 升序分页；拥有空间同时存在成员记录也不会重复。total 只统计该用户可访问的空间。并发改动可能使两次计数/分页查询观察到不同状态；不承诺分页期间的快照不变。
+
+错误约定：身份或账户无效 401（Bearer challenge）；有效成员缺少操作权限 403；不存在或不可访问 404（`Workspace not found`）；非法输入 422；已识别的数据库不可用 503；其他内部错误 500。受保护响应含 `Cache-Control: no-store`，405 同时保留框架的 `Allow`。
+
+### 写事务、锁协议与提交结果
+
+POST/PATCH/DELETE 使用专用 `workspace_write_session`，不复用注册提交标记。服务在同一事务中检查启用账户并执行写入，先构造白名单响应；事务管理器在调用 commit 前再显式 flush。操作或显式 flush 失败时尚未调用 commit，按原错误类型返回脱敏失败并尝试 rollback。只有 commit 正常返回才确认提交成功并返回 201/200/204。close 失败时依次尝试 Session invalidate、保留 Connection 的 invalidate/close。清理日志仅使用固定消息，不记录异常、SQL 参数或凭据。已确认提交后的清理失败不抹掉真实成功；所有底层清理能力同时失效时仍需运营告警和连接处置，不能承诺故障驱动的物理释放一定成功。
+
+PostgreSQL 写连接显式使用 READ COMMITTED、事务级 lock_timeout=5s 和 statement_timeout=15s。锁顺序为：当前 User `FOR SHARE` → 目标 Workspace `FOR UPDATE` → 当前 WorkspaceMember（存在时）`FOR UPDATE`；取得锁后再调用既有 RBAC 服务。创建只锁当前 User，再插入空间。账户禁用、所有权变更、已有成员降级/删除所需的更新锁与这些锁冲突，相关操作应串行完成；这些是设计预期，尚未执行真实 PostgreSQL 并发验证。
+
+未来成员/所有权写服务必须遵循同一协议：先按 UUID 排序锁定所有需要的 User，再按 UUID 排序锁定 Workspace，最后按用户 UUID 排序锁定成员，不得先锁成员再反向等待 Workspace。账户禁用若涉及其他表也必须遵守顺序。死锁/序列化拒绝会安全失败，不自动重试。仅把代码放在同一 Session 不足以保证并发安全，详细协议见架构文档。
+
+提交前由数据库拒绝的写入（例如显式 flush 或 DELETE 执行时的约束拒绝）与提交结果未知分开处理。一旦进入 `Session.commit()`，本实现无法可靠判定异常来自物理提交、提交过程中的隐式 flush，还是物理提交后的 `after_commit` 回调，因此所有普通 commit 异常统一保守返回 503：`Workspace commit outcome is unknown; reconcile before retrying`。即使异常是 IntegrityError 或携带 SQLSTATE 40001/40P01，也不能仅凭类型认定主事务已拒绝。after_commit 抛错时数据可能已经持久化；commit 内部隐式 flush 拒绝时数据也可能未提交，UNKNOWN 表示应用无法证明结果。rollback 不能撤销已提交事实，清理失败也不会覆盖 UNKNOWN。
+
+客户端不得盲目重试 POST/PATCH/DELETE，应先核对实际 Workspace 状态。创建名称不是唯一标识，当前未实现幂等键，创建结果不确定时不能仅凭同名记录认定结果；PATCH 和 DELETE 同样需核对当前名称或资源是否仍存在。
+
+### 数据库与测试边界
+
+本阶段未修改 ORM 或 Alembic revision，未读取真实 `.env`，未连接或写入 PostgreSQL。自动化测试使用合成用户和启用外键的 SQLite 内存库，并通过故障注入检查实际数据。清理故障测试使用带独立 keeper 连接的命名内存数据库，避免池失效销毁数据而掩盖提交结果；不会创建磁盘数据库。
+
+测试覆盖外键级联删除成员、保留 User 与其他空间、租户隔离、输入白名单、分页、提交拒绝/结果不确定和多层清理失败；PostgreSQL 锁语句及事务选项仅离线检查。真实行锁、撤权竞态、死锁、双连接约束与网络中断需另行授权，在独立测试库验证。
+
+2026-11-26 第一轮审查定向修复新增 45 项正式回归。修改实现前的 42 项定向用例为 25 failed、17 passed，修改后同组全部通过；随后补充 3 项提交前真实数据库拒绝叠加清理故障用例。最终提交结果定向 36 passed、offset 边界 9 passed、事务文件 89 passed、CRUD 文件 78 passed、隔离文件 55 passed、原有认证/RBAC 311 passed；全部非集成测试 611 passed、1 deselected，pip check 与 git diff --check 通过。测试阻止真实 .env 读取与 Psycopg 连接。after_commit 故障使用真实 SQLAlchemy Session、正式 ASGI 接口和独立 Session 核查实际创建/更新/删除结果，属于 SQLite 人工注入，不是 PostgreSQL 网络故障或锁竞争实测。定向修复结果等待第二轮独立审查。
+
+成员添加、移除、改权及所有权转移 API 尚未实现；PDF、文献、RAG、Agent 也未实现。未来资源表加入后，必须先确定数据库关联删除、对象存储清理和失败恢复的一致性策略，不能直接假设删除 Workspace 会自动清理外部文件。公网部署安全待办仍包括限流、请求体总量限制、Argon2 并发控制、日志/APM 脱敏、密钥轮换和 HTTPS；历史非法 Argon2 工作参数分类待办未在本阶段修改。
 
 ## 启动前端
 
@@ -262,17 +303,21 @@ paperpilot-researchops/
 │   │   ├── api/request_errors.py
 │   │   ├── api/v1/auth.py      # 注册路由及脱敏边界
 │   │   ├── api/v1/login.py     # 登录和当前账户路由
+│   │   ├── api/v1/workspaces.py # 五个正式 Workspace 路由
 │   │   ├── core/authorization.py
 │   │   ├── core/config.py
 │   │   ├── core/security.py    # 密码策略和 Argon2id
 │   │   ├── core/token.py       # 签发与校验 Access Token
 │   │   ├── db/base.py
 │   │   ├── db/session.py
+│   │   ├── db/workspace_session.py # Workspace 专用写事务
 │   │   ├── models/             # User、Workspace、WorkspaceMember
 │   │   ├── schemas/auth.py     # 认证请求与公开响应
+│   │   ├── schemas/workspace.py
 │   │   ├── services/authentication.py
 │   │   ├── services/registration.py
 │   │   ├── services/workspace_access.py
+│   │   ├── services/workspaces.py
 │   │   └── main.py
 │   ├── tests/
 │   │   ├── __init__.py
@@ -291,7 +336,10 @@ paperpilot-researchops/
 │   │   ├── test_security.py
 │   │   ├── test_readiness.py
 │   │   ├── test_token.py
-│   │   └── test_workspace_access.py
+│   │   ├── test_workspace_access.py
+│   │   ├── test_workspace_crud.py
+│   │   ├── test_workspace_isolation.py
+│   │   └── test_workspace_transactions.py
 │   ├── pytest.ini
 │   └── requirements.txt
 ├── docs/
@@ -321,7 +369,7 @@ paperpilot-researchops/
 
 ## 当前阶段边界
 
-Stage 02B 建立统一 Base.metadata、ORM 字段、关系、约束和离线测试。Stage 02C 已完成初始迁移，并在独立测试库及本地开发库应用 `20261120_0001`。Stage 03A 注册、Stage 03B 登录和 Stage 03C-1 权限判定均沿用该 Schema。Stage 03C-2 将权限检查接入正式工作空间路由。前端认证页面、OAuth、Docker、Redis、云部署、研究 Agent 编排和大模型 API 均在当前范围之外。
+Stage 02B 建立统一 Base.metadata、ORM 字段、关系、约束和离线测试。Stage 02C 已完成初始迁移，并在独立测试库及本地开发库应用 `20261120_0001`。Stage 03A 注册、Stage 03B 登录、Stage 03C-1 权限判定和 Stage 03C-2 Workspace CRUD 均沿用该 Schema。前端认证页面、成员管理、所有权转移、OAuth、Docker、Redis、云部署、研究 Agent 编排和大模型 API 均在当前范围之外。
 
 ## Alembic 迁移（Stage 02C 已完成）
 
@@ -354,6 +402,22 @@ SQL 预览命令中的 **`--sql` 必须保留**：它仅生成从 base 开始的
 仓库内迁移单元测试捕获 Alembic 操作、比较 SQLAlchemy 结构并离线编译 SQL；在线配置测试使用替身连接，既有 PostgreSQL integration 测试仍只执行 `SELECT 1`。Stage 02C-2B 另行在独立 PostgreSQL 测试库完成了真实迁移和 17 组约束行为验证，使用 SAVEPOINT 处理预期异常并回滚所有测试数据；这项演练不属于每次 pytest 自动执行的测试。
 
 ## 本地验证记录
+
+### Stage 03C-2 离线验证
+
+2026-11-25，使用现有 `.venv` Python 3.11.6，通过带真实 `.env` 读取和 PostgreSQL 连接拦截的测试进程执行。禁用字节码及 pytest 缓存，合成测试文件仅位于临时目录；所有新增数据均在 SQLite 内存中。
+
+| 检查项 | 实际结果 | 退出码 |
+| --- | --- | --- |
+| `tests/test_workspace_crud.py` | 69 passed | 0 |
+| `tests/test_workspace_isolation.py` | 55 passed | 0 |
+| `tests/test_workspace_transactions.py` | 53 passed | 0 |
+| Stage 03A/03B/03C-1 专项回归（8 个原有文件） | 311 passed | 0 |
+| 全部非集成测试 | 566 passed，1 deselected，0 failed，0 skipped | 0 |
+| pip check | No broken requirements found. | 0 |
+| git diff --check | 通过 | 0 |
+
+新增 177 项测试，原有 389 项全部保留并通过。唯一 deselected 是既有真实 PostgreSQL 集成测试。未执行 PostgreSQL 并发、写入或在线迁移；行锁及事务参数只有离线检查证据。以上是开发验证，不代替 Stage 03C-2 的独立代码审查。
 
 ### Stage 03A 验证
 

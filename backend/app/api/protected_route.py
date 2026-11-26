@@ -61,8 +61,12 @@ class ProtectedRoute(APIRoute):
 
         try:
             await super().handle(scope, receive, tracked_send)
-        except HTTPException:
-            raise
+        except HTTPException as error:
+            if started:
+                raise RuntimeError("Protected response interrupted") from None
+            response = JSONResponse(status_code=error.status_code, content={"detail": error.detail}, headers=error.headers)
+            response.headers["Cache-Control"] = "no-store"
+            await response(scope, receive, send)
         except Exception as error:
             if started:
                 raise RuntimeError("Protected response interrupted") from None
