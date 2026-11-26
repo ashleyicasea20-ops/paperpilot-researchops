@@ -153,3 +153,15 @@ def workspace_api(workspace_tenants, auth_client):
         options.setdefault("headers", {} if user is None else {"Authorization": "Bearer " + workspace_tenants.tokens[user]})
         return getattr(auth_client, method.lower())(path, **options)
     return request
+
+
+@pytest.fixture
+def member_api(workspace_tenants, auth_client):
+    def request(method, *, user="A", workspace="A", target=None, **options):
+        workspace_id = workspace_tenants.spaces.get(workspace, workspace)
+        path = "/api/v1/workspaces/" + str(workspace_id) + "/members"
+        if target is not None:
+            path += "/" + str(workspace_tenants.users.get(target, target))
+        options.setdefault("headers", {} if user is None else {"Authorization": "Bearer " + workspace_tenants.tokens[user]})
+        return getattr(auth_client, method.lower())(path, **options)
+    return request
