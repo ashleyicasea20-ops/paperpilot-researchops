@@ -13,10 +13,11 @@ PaperPilot ResearchOps 是面向 AI 科研工作流与实验智能管理的全�
 | Stage 03A | 已合并，提供用户注册、邮箱规范化、密码策略和 Argon2id 哈希 |
 | Stage 03B | 已合并，提供登录、短期 JWT Access Token 和当前用户查询 |
 | Stage 03C-1 | 已合并：可复用身份依赖和工作空间 RBAC |
-| Stage 03C-2 | Workspace CRUD、分页隔离与写事务保护已实现，等待独立代码审查；PostgreSQL 并发验证尚未执行 |
-| 后续阶段 | 成员管理、邮箱归属验证、PDF 文献与资源隔离 |
+| Stage 03C-2 | 已通过第二轮独立审查并合并：Workspace CRUD、分页隔离与写事务保护；PostgreSQL 并发验证尚未执行 |
+| Stage 03C-3 | 成员查询、直接添加、改权和移除已完成离线开发与回归，等待独立代码审查及另行授权的 PostgreSQL 并发验收 |
+| 后续阶段 | 邀请接受、所有权转移、邮箱归属验证、PDF 文献与资源隔离 |
 
-注册和登录是两次独立请求。后端已接入正式 Workspace CRUD；成员管理和 PDF 资源接口尚未实现。
+注册和登录是两次独立请求。后端已接入正式 Workspace CRUD 和成员管理 API；前端成员页面与 PDF 资源接口尚未实现。
 
 ## 技术栈
 
@@ -243,9 +244,44 @@ PostgreSQL 写连接显式使用 READ COMMITTED、事务级 lock_timeout=5s 和 
 
 测试覆盖外键级联删除成员、保留 User 与其他空间、租户隔离、输入白名单、分页、提交拒绝/结果不确定和多层清理失败；PostgreSQL 锁语句及事务选项仅离线检查。真实行锁、撤权竞态、死锁、双连接约束与网络中断需另行授权，在独立测试库验证。
 
-2026-11-26 第一轮审查定向修复新增 45 项正式回归。修改实现前的 42 项定向用例为 25 failed、17 passed，修改后同组全部通过；随后补充 3 项提交前真实数据库拒绝叠加清理故障用例。最终提交结果定向 36 passed、offset 边界 9 passed、事务文件 89 passed、CRUD 文件 78 passed、隔离文件 55 passed、原有认证/RBAC 311 passed；全部非集成测试 611 passed、1 deselected，pip check 与 git diff --check 通过。测试阻止真实 .env 读取与 Psycopg 连接。after_commit 故障使用真实 SQLAlchemy Session、正式 ASGI 接口和独立 Session 核查实际创建/更新/删除结果，属于 SQLite 人工注入，不是 PostgreSQL 网络故障或锁竞争实测。定向修复结果等待第二轮独立审查。
+2026-11-26 第一轮审查定向修复新增 45 项正式回归。修改实现前的 42 项定向用例为 25 failed、17 passed，修改后同组全部通过；随后补充 3 项提交前真实数据库拒绝叠加清理故障用例。最终提交结果定向 36 passed、offset 边界 9 passed、事务文件 89 passed、CRUD 文件 78 passed、隔离文件 55 passed、原有认证/RBAC 311 passed；全部非集成测试 611 passed、1 deselected，pip check 与 git diff --check 通过。测试阻止真实 .env 读取与 Psycopg 连接。after_commit 故障使用真实 SQLAlchemy Session、正式 ASGI 接口和独立 Session 核查实际创建/更新/删除结果，属于 SQLite 人工注入，不是 PostgreSQL 网络故障或锁竞争实测。该修复后已通过第二轮独立审查并合并；此处保留开发验证记录，PostgreSQL 并发验收仍未完成。
 
-成员添加、移除、改权及所有权转移 API 尚未实现；PDF、文献、RAG、Agent 也未实现。未来资源表加入后，必须先确定数据库关联删除、对象存储清理和失败恢复的一致性策略，不能直接假设删除 Workspace 会自动清理外部文件。公网部署安全待办仍包括限流、请求体总量限制、Argon2 并发控制、日志/APM 脱敏、密钥轮换和 HTTPS；历史非法 Argon2 工作参数分类待办未在本阶段修改。
+Stage 03C-3 接入下述成员添加、改权与移除接口；所有权转移、PDF、文献、RAG、Agent 尚未实现。未来资源表加入后，必须先确定数据库关联删除、对象存储清理和失败恢复的一致性策略，不能直接假设删除 Workspace 会自动清理外部文件。公网部署安全待办仍包括限流、请求体总量限制、Argon2 并发控制、日志/APM 脱敏、密钥轮换和 HTTPS；历史非法 Argon2 工作参数分类待办未在本阶段修改。
+
+## Workspace 成员 API（Stage 03C-3）
+
+以下接口均使用 JWT，检查当前账户启用状态，并在正式应用注册：
+
+| 方法与路径 | 成功响应 | 权限 |
+| --- | --- | --- |
+| GET `/api/v1/workspaces/{workspace_id}/members` | 200，items/total/limit/offset | member:read，四种角色均可 |
+| POST `/api/v1/workspaces/{workspace_id}/members` | 201，MemberResponse | Owner 可添加三种角色；Admin 只可添加 editor/viewer |
+| PATCH `/api/v1/workspaces/{workspace_id}/members/{user_id}` | 200，MemberResponse | Owner 可改普通成员；Admin 只可在 editor/viewer 之间改权 |
+| DELETE `/api/v1/workspaces/{workspace_id}/members/{user_id}` | 204，无正文 | Owner 可移除普通成员；Admin 只可移除 editor/viewer |
+
+POST 请求为 `{"user_id":"<UUID>","role":"viewer"}`，两个字段均必填；PATCH 只接受必填的 `{"role":"editor"}`。角色严格限于小写 admin/editor/viewer。非法 UUID、非法角色、空 PATCH 和额外字段返回脱敏 422；操作者只能来自已验签 JWT 的 sub，不能提交 owner_id、actor_id、current_role、时间戳或通过 PATCH 的 user_id 改写身份。
+
+公开成员字段仅有 user_id、role、joined_at，不公开邮箱、密码哈希或账户内部信息。列表中 Owner 是由 Workspace.owner_id 生成的虚拟记录，role=owner、joined_at=null，始终排在首位；其余成员按 joined_at、user_id 升序排列。已有冗余 Owner 成员行会被去重，非法成员角色被排除；接口不会创建 Owner 成员行。默认 limit=20、上限 100，offset 范围 0–9223372036854775807。total 包含唯一虚拟 Owner；计数和分页 SQL 都限定目标 Workspace 及当前调用者访问资格，不承诺并发时的冻结快照。
+
+Editor/Viewer 只能读取成员，非成员与不存在的 Workspace 统一返回 404 `Workspace not found`。具有访问资格但管理权限不足返回 403。任何人都不能经成员 API 管理真实 Owner 或自己的成员记录；Admin 不能管理其他 Admin，也不能把任何成员晋升为 Admin。相同角色 PATCH 在完整授权后返回 200 且不执行 UPDATE；重复 DELETE 返回成员 404。重复 POST 仅在调用者有权管理当前角色及请求角色时返回 409 `Member already exists`，否则仍拒绝为 403。
+
+添加只支持已经注册且启用的目标账户。先做只读预授权，不合格请求不会查询目标账户状态或取得目标 User 锁；最终权限仍必须在完整锁定后重新读取。已授权管理者的未知/禁用目标账户与不存在成员均使用固定 404 `Member not found`。已有禁用成员仍可由合格管理者改权或移除，禁用不会自动清除成员关系。删除成员只删除目标关联，不删除 User、Workspace 或其他空间的成员。
+
+成员管理是受权限限制的直接添加模式，不等于邀请接受；本阶段不提供用户搜索、邮件邀请、成员自行退出或所有权转移。移除或降级提交后，后续请求从数据库重新判定权限，不更改该用户其他 Workspace 的角色。
+
+### 成员写入锁、事务和验证边界
+
+共用的锁辅助函数位于 `services/workspace_access.py`，Workspace CRUD 与成员写入都调用它。成员写入的行锁顺序是：按 UUID 排序的操作者和目标 User `FOR SHARE` → Workspace `FOR UPDATE` → 按用户 UUID 排序的操作者和目标成员 `FOR UPDATE` → 重新读取操作者权限和目标当前角色 → can_manage_member 校验 → 写入。预授权结果不替代锁后授权，不能先锁 Workspace 再回头锁目标 User。
+
+不存在的成员行不能被 SELECT FOR UPDATE 锁定，因此合作写事务以 Workspace 行锁串行化，再由复合主键兜底。预检查发现重复返回 409；显式 INSERT flush 发生已知主键拒绝也可返回 409，其他约束错误不会一律当作重复。这是提交前业务分类，不改变共用 `workspace_write_session()` 的规则：commit 开始后抛出的普通异常仍为 UNKNOWN 503，文案保持 `Workspace commit outcome is unknown; reconcile before retrying`；确认 commit 成功后的清理故障保留成功，不自动重试。UNKNOWN 客户端应先查询成员现状。
+
+离线设计预期：两个管理者添加相同成员由 Workspace 锁排序，后执行者重新检查重复；Owner 改权与 Admin 改权、Admin 被降级/移除与其写入也按 Workspace/成员锁排序并重新授权；Workspace 删除先完成则成员写入 404，成员写入先完成则随后删除可级联该关系；目标禁用先完成则拒绝新增，添加先取得 User SHARE 锁则禁用更新需等待。相反操作者/目标顺序必须采用相同的 User UUID 排序。以上不是实际 PostgreSQL 并发证明。
+
+2026-11-26 在既有 Python 3.11.6 环境中新增 256 项测试：API/权限 144 passed、隔离 45 passed、事务 67 passed。全量非集成测试 867 passed、1 deselected、0 failed、0 skipped，pip check 和 git diff --check 通过，所有最终命令退出码 0。历史 611 项保留，使用合成账户/JWT、启用外键的 SQLite 内存库和正式 ASGI 请求；独立 Session 核查插入、更新、删除及提交后异常的真实结果。过期重复预检查测试验证了真实主键拒绝，不代表实际双连接竞争。
+
+测试进程禁止真实 .env 读取和 Psycopg 连接；未修改 ORM、迁移或依赖。真实 PostgreSQL 的双连接角色降级、成员移除、重复添加、Workspace 删除竞争、账户禁用竞争、锁等待、死锁回滚、READ COMMITTED 可见性、提交应答丢失和网络中断，必须另行授权独立测试库验收。不得用 paperpilot_dev 或 paperpilot_migration_test 写测试代替。
+
+保留的 P3：FastAPI 生成的响应 OpenAPI 组件可能将 int64 maximum 转为浮点表示；请求参数及实际 Pydantic 边界是精确整数，本轮未修复该文档表示问题。已有部署安全待办继续保留。后续 PDF、文献及 RAG 资源必须绑定 Workspace，并在每次查询和写入中执行对应授权，成员接口本身不提供资源隔离实现。
 
 ## 启动前端
 
@@ -369,7 +405,7 @@ paperpilot-researchops/
 
 ## 当前阶段边界
 
-Stage 02B 建立统一 Base.metadata、ORM 字段、关系、约束和离线测试。Stage 02C 已完成初始迁移，并在独立测试库及本地开发库应用 `20261120_0001`。Stage 03A 注册、Stage 03B 登录、Stage 03C-1 权限判定和 Stage 03C-2 Workspace CRUD 均沿用该 Schema。前端认证页面、成员管理、所有权转移、OAuth、Docker、Redis、云部署、研究 Agent 编排和大模型 API 均在当前范围之外。
+Stage 02B 建立统一 Base.metadata、ORM 字段、关系、约束和离线测试。Stage 02C 已完成初始迁移，并在独立测试库及本地开发库应用 `20261120_0001`。Stage 03A 注册、Stage 03B 登录、Stage 03C-1 权限判定、Stage 03C-2 Workspace CRUD 和 Stage 03C-3 成员 API 均沿用该 Schema。前端认证/成员页面、邀请接受、成员自行退出、所有权转移、OAuth、Docker、Redis、云部署、研究 Agent 编排和大模型 API 均在当前范围之外。
 
 ## Alembic 迁移（Stage 02C 已完成）
 
@@ -403,7 +439,7 @@ SQL 预览命令中的 **`--sql` 必须保留**：它仅生成从 base 开始的
 
 ## 本地验证记录
 
-### Stage 03C-2 离线验证
+### Stage 03C-2 初版离线验证（历史记录）
 
 2026-11-25，使用现有 `.venv` Python 3.11.6，通过带真实 `.env` 读取和 PostgreSQL 连接拦截的测试进程执行。禁用字节码及 pytest 缓存，合成测试文件仅位于临时目录；所有新增数据均在 SQLite 内存中。
 

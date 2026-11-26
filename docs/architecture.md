@@ -2,7 +2,7 @@
 
 ## Stage 02C status: local database infrastructure complete
 
-Stage 01 completed the frontend/backend foundation. Stage 02A established synchronous PostgreSQL connectivity, Settings, session lifecycle management, and readiness. Stage 02B added User, Workspace, and WorkspaceMember ORM definitions. Stage 02C completed Alembic configuration and initial revision 20261120_0001 and recorded an approved local migration and isolated rehearsal. Stage 03A added registration, Stage 03B added login, Stage 03C-1 added identity/RBAC, and Stage 03C-2 adds production Workspace CRUD using that same schema. Stage 03C-2 does not inspect or mutate the actual PostgreSQL environment. Member/ownership management APIs, mailbox verification and PDF/resource isolation remain future work.
+Stage 01 completed the frontend/backend foundation. Stage 02A established synchronous PostgreSQL connectivity, Settings, session lifecycle management, and readiness. Stage 02B added User, Workspace, and WorkspaceMember ORM definitions. Stage 02C completed Alembic configuration and initial revision 20261120_0001 and recorded an approved local migration and isolated rehearsal. Stage 03A added registration, Stage 03B added login, Stage 03C-1 added identity/RBAC, and Stage 03C-2 added production Workspace CRUD. Stage 03C-3 adds member list/add/role-change/remove APIs using that same schema. Stages 03C-2/3 do not inspect or mutate the actual PostgreSQL environment. Ownership transfer, invitations/acceptance, mailbox verification and PDF/resource isolation remain future work.
 
 ## Runtime topology
 
@@ -188,7 +188,49 @@ The initial 2026-11-25 development baseline was 566 non-integration cases with o
 
 Final Python 3.11.6 results are 36 commit-focused cases, 9 offset cases, 89 transaction cases, 78 CRUD cases, 55 isolation cases, 311 existing authentication/RBAC cases, and 611 non-integration cases overall with one integration case deselected. Final commands, pip check and git diff --check exited 0, with no final failures or skips. New after_commit tests exercise POST/PATCH/DELETE with IntegrityError, OperationalError carrying 40001/40P01, and RuntimeError, with and without cleanup faults. They record the callback phase and the same exception propagating from the real Session.commit(), assert one commit/one HTTP response, and independently verify durable data. SQLite-only triggers provide actual pre-commit database rejection; offset tests verify 0, 1, the int64 maximum and invalid inputs without opening a database Session.
 
-Test processes block real .env reads and Psycopg connections. No real PostgreSQL network interruption, row-lock contention, concurrency, migration or Workspace writes were exercised. SQLite fault injection and offline compilation are not native PostgreSQL evidence. These repair results await a second independent Stage 03C-2 review.
+Test processes block real .env reads and Psycopg connections. No real PostgreSQL network interruption, row-lock contention, concurrency, migration or Workspace writes were exercised. SQLite fault injection and offline compilation are not native PostgreSQL evidence. These repairs subsequently passed the second independent Stage 03C-2 review and were merged; native concurrency acceptance remains outstanding.
+
+### Stage 03C-3 production membership management
+
+Four production operations are added under `/api/v1/workspaces/{workspace_id}/members`: GET list (200), POST add (201), PATCH `/{user_id}` (200), and DELETE `/{user_id}` (204, empty body). They use TokenSubject and a small WorkspaceRoute subclass, preserving strict JWT/current-account checks, no-store, 405 Allow, redacted errors, and the existing UNKNOWN 503. No separate authentication, role matrix, Engine or commit-classification mechanism is introduced.
+
+POST requires exactly user_id UUID and role; PATCH requires exactly role. Only admin/editor/viewer literals are accepted; unknown fields, malformed UUIDs/roles and empty PATCH return fixed 422 `Invalid member input`. Public MemberResponse is exactly user_id, role, joined_at. Email, hashes and account internals are never serialized. The Owner appears as one virtual owner entry with joined_at=null, derived solely from Workspace.owner_id. Redundant owner membership rows and invalid stored roles are excluded from the ordinary member branch. The API never inserts an owner membership.
+
+| Actor | List | Add | Change existing roles | Remove |
+| --- | --- | --- | --- | --- |
+| Owner | Yes | admin/editor/viewer | Between all three ordinary roles | All ordinary roles |
+| Admin | Yes | editor/viewer | editor/viewer only, checking both old/new values | editor/viewer only |
+| Editor/Viewer | Yes | No | No | No |
+| Nonmember | 404 | 404 | 404 | 404 |
+
+All member writes reject the real Owner and the actor's own UUID, including same-role requests. An authorized same-role PATCH returns 200 without UPDATE and retains joined_at; repeat DELETE returns member 404. Direct addition targets an already registered, active account. Inactive existing members may still be changed or removed by a qualified manager. No invitation confirmation, user search, account creation, leave or ownership transfer is implemented; direct addition is a separate product choice from invitation acceptance.
+
+List authorization requires member:read. The SQL reuses the existing scoped Workspace query in both count and page, UNION ALLs one virtual owner with valid ordinary members, excludes owner duplicates and sorts owner first, then joined_at/user_id. Pagination defaults to 20/0, limit is 1–100 and offset 0–2**63-1. Total includes the virtual owner and cannot count other workspaces. Count/page remain separate point-in-time reads; concurrent pagination is not a frozen snapshot. The historical OpenAPI response-maximum floating-point representation P3 remains open; actual request and Pydantic bounds are exact.
+
+A read-only preliminary management check prevents unauthorized target-account lookups and locks. Missing/inaccessible workspaces remain indistinguishable 404s; insufficient privileges return 403 before target account status is examined. Authorized managers see fixed member 404 for absent/inactive add targets or missing member targets. Duplicate addition is 409 only if the manager can manage both the existing and requested role; an Admin targeting another Admin still receives 403. No raw database diagnostic or target email is exposed.
+
+The shared `lock_active_accounts` and `lock_workspace_permission` functions were extracted into workspace_access; existing CRUD retains its one-user lock semantics. Member writers acquire all participating User FOR SHARE rows in UUID order, then Workspace FOR UPDATE, then actor/target membership FOR UPDATE rows in user UUID order. Only after these locks are acquired does the service re-read the active actor, authoritative owner and actor role. It reads the target's actual role using a scalar row query, evaluates can_manage_member with both role values, and performs a workspace/user/old-role-scoped mutation in the same transaction. The preliminary context is never the write authority. No target User lock is acquired after Workspace, no role cache/identity-map shortcut is used, and the helpers neither commit nor close their caller's Session.
+
+Absent memberships have no row/gap lock. Cooperative writers serialize on Workspace; the existing composite PK is the final uniqueness guard. Known PK rejection from the explicit pre-commit INSERT flush maps to 409 (PostgreSQL 23505 plus the exact PK name, or SQLite's native PK rejection), while unrelated constraint errors retain their generic failure classification. Commit errors are never caught by this duplicate handler. All writes reuse workspace_write_session: explicit flush before commit, acknowledged success only after normal commit return, every unproven commit exception UNKNOWN, and confirmed success retained after cleanup faults. Clients must reconcile member state after UNKNOWN instead of automatically repeating a write.
+
+Concurrency expectations requiring native PostgreSQL verification:
+
+| Scenario | Expected serialization under the shared protocol |
+| --- | --- |
+| Two Admins add one target | Workspace orders writers; the later request re-reads membership and gets 409 if authorized for its current role |
+| Owner and Admin change one target | Later authorization uses the latest role; promotion to admin by Owner prevents subsequent Admin management |
+| Admin is downgraded/removed during a write | If revocation wins Workspace/member locks, final authorization returns 403/404; if the writer wins, its operation finishes before revocation |
+| Workspace deletion versus add | Delete first yields Workspace 404; add first may commit and then be removed by the later Workspace cascade |
+| Target disable versus add | User SHARE conflicts with account UPDATE; disable first rejects add, add first completes before disable |
+| Opposite actor/target UUID order | Every participant requests User rows in the same sorted order; member locks are also sorted, avoiding an application-level reversed order |
+
+Future account/ownership writers must follow the same global order, including all required users before Workspace. No transaction may first lock a member and then wait for Workspace or upgrade a User lock after acquiring Workspace. These rules do not prove absence of all native deadlocks; the existing 5s lock_timeout, 15s statement_timeout, rollback and no-retry policy still apply.
+
+On 2026-11-26, the existing Python 3.11.6 environment passed 144 membership API cases, 45 isolation cases and 67 transaction cases (256 new), and 867 non-integration cases overall, with one integration case deselected, zero failures/skips and exit code 0. pip check and git diff --check passed. The original 611 tests are retained without changes to their test files; conftest only adds a member-route client fixture. Production ASGI requests use six synthetic users and two memory workspaces with FK enforcement. Separate Sessions verify persisted membership changes, unchanged users/workspaces/other memberships, primary-key rejection, after_commit IntegrityError/40001/40P01/runtime failures, cleanup failures, UNKNOWN responses, single commits and single HTTP responses. A stale precheck test exercises native SQLite PK rejection; it does not claim a real two-writer race.
+
+Tests block real .env reads and Psycopg entry points. PostgreSQL lock clauses and member count/page SQL were compiled offline only. No ORM, revision or dependency changes, native PostgreSQL connections, schema changes or business writes were performed. Final concurrency acceptance needs an explicitly authorized isolated database for two-connection downgrade, removal, duplicate add, Workspace deletion, account disable, timeout, deadlock/rollback, READ COMMITTED visibility and commit acknowledgement/network-loss cases. Neither paperpilot_dev nor paperpilot_migration_test is a substitute write-test target.
+
+The existing invalid-Argon2-parameter classification, request-size limits, rate limits, Argon2 resource caps, log/APM redaction, key rotation and HTTPS deployment tasks remain open. Future PDF/document/RAG resources must carry workspace linkage and enforce authorized scope on every query and write. No resource management or Stage 04 functionality is added here. Stage 03C-3 offline development awaits independent review and separately authorized native concurrency acceptance.
 
 ## Configuration and security
 
@@ -240,7 +282,7 @@ Relationships use explicit `back_populates`: User.owned_workspaces ↔ Workspace
 
 Deleting a user who still owns a workspace is rejected by the owner FK's `ON DELETE RESTRICT`. User.owned_workspaces uses `passive_deletes="all"` with no delete cascade so ORM deletion does not null out owner IDs or delete owned workspaces, even when that relationship is loaded. Workspace and ordinary user deletion remove associated membership rows using `ON DELETE CASCADE`; membership collections also use ORM delete-orphan cascade and passive deletion for unloaded collections.
 
-Database constraints guarantee references, non-null/nonblank values, email uniqueness under the stated case rules, valid member roles, unique member pairs, and the deletion policies. Request authorization also checks the active account, workspace linkage and required permission. Future member-writing services must prevent redundant owner membership. Future workspace and resource endpoints must scope each query or mutation to the authorized workspace. Database row-level security remains outside this stage.
+Database constraints guarantee references, non-null/nonblank values, email uniqueness under the stated case rules, valid member roles, unique member pairs, and the deletion policies. Request authorization also checks the active account, workspace linkage and required permission. Stage 03C-3 member writers prevent redundant owner membership. Future resource endpoints must scope each query or mutation to the authorized workspace. Database row-level security remains outside this stage.
 
 ## Timestamp behavior
 
@@ -248,7 +290,7 @@ User and Workspace share non-null `created_at` and `updated_at`; WorkspaceMember
 
 ## Intended growth path
 
-Future capabilities should be added behind tested service boundaries. Stage 02C applied the initial schema to the validated local development environment. Stage 03A implements registration, input normalization, and password hashing. Stage 03B verifies identity at `/me`. Stage 03C-1 resolves current workspace roles and permissions, and Stage 03C-2 applies these checks to production Workspace CRUD. Member/ownership management, mailbox verification and PDF/resource tenant isolation remain separate milestones.
+Future capabilities should be added behind tested service boundaries. Stage 02C applied the initial schema to the validated local development environment. Stage 03A implements registration, input normalization, and password hashing. Stage 03B verifies identity at `/me`. Stage 03C-1 resolves current workspace roles and permissions, Stage 03C-2 applies them to Workspace CRUD, and Stage 03C-3 extends them to membership management. Ownership transfer, invitations/acceptance, mailbox verification and PDF/resource tenant isolation remain separate milestones.
 
 ## Alembic configuration and version history
 
