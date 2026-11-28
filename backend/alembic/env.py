@@ -42,6 +42,9 @@ def run_migrations_online() -> None:
     error_type = None
     try:
         connection = config.attributes.get("connection")
+        if config.attributes.get("paperpilot_pg_test"):
+            from tests.postgres.migrations import require_test_migration_connection
+            require_test_migration_connection(config, connection, context.get_revision_argument())
         if connection is not None:
             configure_connection(connection)
         else:

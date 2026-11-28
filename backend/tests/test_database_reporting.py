@@ -10,7 +10,7 @@ from tests import test_database_integration as integration
 
 
 @pytest.mark.parametrize("source", ["driver", "configuration"])
-def test_integration_failure_suppresses_sensitive_exception_context(monkeypatch, source):
+def test_integration_failure_suppresses_sensitive_exception_context(source):
     marker = "private-test-sentinel"
     if source == "driver":
         failure = OperationalError(None, {"password": marker}, RuntimeError(marker))
@@ -22,11 +22,9 @@ def test_integration_failure_suppresses_sensitive_exception_context(monkeypatch,
     def unavailable():
         raise failure
 
-    monkeypatch.setattr(integration, "Path", lambda _: SimpleNamespace(is_file=lambda: True))
-    monkeypatch.setattr(integration, "get_engine", unavailable)
-
+    engine = SimpleNamespace(connect=unavailable)
     with pytest.raises(pytest.fail.Exception) as caught:
-        integration.test_real_postgresql_select_one()
+        integration._check_select_one(engine)
 
     assert marker not in str(caught.value)
     assert type(failure).__name__ in str(caught.value)
