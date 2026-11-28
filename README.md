@@ -283,6 +283,118 @@ Editor/Viewer 只能读取成员，非成员与不存在的 Workspace 统一返�
 
 保留的 P3：FastAPI 生成的响应 OpenAPI 组件可能将 int64 maximum 转为浮点表示；请求参数及实际 Pydantic 边界是精确整数，本轮未修复该文档表示问题。已有部署安全待办继续保留。后续 PDF、文献及 RAG 资源必须绑定 Workspace，并在每次查询和写入中执行对应授权，成员接口本身不提供资源隔离实现。
 
+
+## PostgreSQL 测试安全入口（Stage 03C-4B-0）
+
+本阶段只实现和离线验证测试基础设施。第一轮独立审查结论为 **FAIL**：原有 1017 项测试通过，没有覆盖可自构造的授权对象、缓存连接、原生别名、早期插件及租约撤销顺序。下表记录本轮定向修复；仍须第二轮独立审查和人工验收。
+
+| 发现 | 修复 |
+| --- | --- |
+| F1：自构造 PgOptIn 获得连接许可 | PgOptIn 仅表达离线意图；真实许可绑定隔离进程、实际 pytest Config、当前标记测试、运行阶段和双重开关 |
+| F2：缓存 Engine/Session/Connection 及旧入口绕过 | 独立新进程；启动时拒绝未登记 PG Engine；Engine、SQL、提交执行门；旧集成入口检查可信 live Engine |
+| F3：函数别名及 binary PQ 导出 | 覆盖当前安装版本的 Python/原生模块导出和真实生成器链；已保存的 C 引用仍是明确的进程内保护边界 |
+| F4：早期插件先于守卫 | 可信启动器在导入 pytest 前安装守卫；禁用插件自动加载和环境注入，只接受静态批准的插件 |
+| F5：失效 .info 隐式重连 | 先检查 closed/invalidated，再访问 .info/DBAPI；初始化回调也遵守此顺序 |
+| F6：准入及清理失败留下旧租约 | 先从独立弱引用注册表撤销租约，再检查及清理；清理全失败也不恢复许可 |
+| F7：熔断后借出连接仍执行 | 每次执行及 commit 检查 Engine/当前运行期/租约；熔断、dispose 同时撤销所有租约 |
+| F8：启动测试预装被测守卫 | 子进程只预装独立物理替身；正式启动链自行安装项目守卫，验证早期钩子、收集、不同目录和错误入口 |
+
+### 启动入口与信任边界
+
+推荐默认离线入口，从 backend 运行：
+
+```powershell
+.\.venv\Scripts\python.exe -B run_pg_tests.py -q
+```
+
+启动器校验路径与选项，清除应用 DB/JWT、PYTEST 插件/参数注入和 Python 路径注入环境，另起 `python -I -B` 进程。bootstrap 先安装环境审计、驱动、SQLAlchemy 和数据库库日志脱敏，再导入 pytest。当前仅批准安全插件及 `tests.postgres._startup_probe` 审计插件；拒绝任意 `-p`、`-c`、`-o` 和仓库测试目录以外的路径。
+
+普通 `python -m pytest` 仍默认跳过旧 `integration` 和三个 `postgres_*` 组；root conftest 在应用 fixtures 前阻止真实 .env 和支持的 PG 入口。它无法抢在任意手工注入的早期第三方插件之前执行，所以不能用于申请真实 PG 许可。给普通 pytest 传 `--pg-test` 或 `--pg-fault` 会拒绝；真实测试必须走可信入口。上述保护只作用于测试进程，不修改正式应用。
+
+未来另行获得数据库操作授权并完成环境隔离后，基础测试必须同时使用可信入口的 `--pg-test` 和精确 `PAPERPILOT_PG_TEST_ENABLE=1`；故障测试还需 `--pg-fault` 和 `PAPERPILOT_PG_TEST_FAULT_ENABLE=1`。收集、早期钩子和测试结束后没有连接许可。只有当前已标记测试的 setup/call/teardown 阶段可用；跨测试缓存 live Engine 会因运行期 nonce 改变而失效。技术开关不代表本轮获准连接数据库。
+
+### 专用配置与二次身份核验
+
+未来为独立 PostgreSQL 17 测试实例做环境验收时，须核验生效的 `max_prepared_transactions = 0`，由服务器禁用 prepared transactions。此项为待验收要求，当前尚未核验。客户端测试守卫仍须独立拒绝两阶段事务控制命令。
+
+Settings 禁用 dotenv 和文件 secrets，无应用默认值；以下字段全部必填：
+
+| 专用环境变量 | 约束 |
+| --- | --- |
+| PAPERPILOT_PG_TEST_ENABLE | 精确 1 |
+| PAPERPILOT_PG_TEST_HOST | 精确 127.0.0.1 |
+| PAPERPILOT_PG_TEST_PORT | 精确 55432 |
+| PAPERPILOT_PG_TEST_DB_NAME | 精确 paperpilot_concurrency_test |
+| PAPERPILOT_PG_TEST_USER | 精确 paperpilot_test_app |
+| PAPERPILOT_PG_TEST_PASSWORD | 独立非空测试密码；SecretStr，不写入 Git/聊天 |
+| PAPERPILOT_PG_TEST_ENVIRONMENT_ID | 规范小写 UUID4，与服务器标识相同 |
+
+拒绝继承的全部 `PG*` libpq 环境变量、开发端口、多 Host、socket、开发库及历史迁移库；使用 URL.create，不拼接密码。独立合成 AuthSettings 使用 `_env_file=None`，不复用开发 JWT 密钥。错误采用固定信息，测试进程在 LogRecord 进入任何日志 handler 前清除 psycopg/sqlalchemy 的消息参数和异常详情，包括 DEBUG 和连接池清理故障。应用 logger 不受此规则改写；测试期间数据库库详细日志有意不保留。
+
+专用 Engine 使用 READ COMMITTED、独立四连接池和有界超时。首次 PostgreSQL 方言初始化仅临时允许绑定当前 Engine/Connection/DBAPI 的三条固定只读查询（version/current_schema/standard_conforming_strings），结束即撤销，不能用于业务 SQL。禁用非必要 hstore 查询和 pool_pre_ping；每次租用完整核验替代 ping。
+
+正式核验在有界只读事务内检查实际库名、用户、地址/端口、17.x、search_path、最小权限、数据库/表 Owner、环境标识、唯一 revision 和反射 Schema，包括全局 lower(email) 唯一索引及完整 FK/CHECK。核验事务 rollback 成功才发放连接/驱动绑定的逻辑租约。驱动或初始化失败同样熔断；回收、invalidate、detach、dispose 和失败均撤销许可。允许清理 rollback/close，但清理失败不能恢复业务执行资格。
+
+环境标识契约为 `test_control.environment` 的 id=1、UUID4 和 purpose=`paperpilot-postgres-tests`，由 `paperpilot_test_owner` 持有；普通测试角色不得修改标识、Schema 或版本表。数据库、业务表也要求该 Owner。当前没有建立专用实例、数据库、角色或标识；候选实例目录 `D:\PostgreSQL\paperpilot_concurrency_17` 及端口均未实测。
+
+测试迁移仅准备绑定已核验连接、租约和 revision `20261120_0001` 的 Alembic Config；缺失/替换/过期连接会拒绝，不回退应用 Engine。模块不执行 upgrade/downgrade/stamp。空库首次初始化需要单独 Owner/Migrator 设计；不能用 create_all 冒充迁移。
+
+### 尚未实现的环境边界
+
+Python 私有变量、dataclass、ContextVar 和 Monkeypatch 都不是恶意 Python 沙箱。测试证明：保存的 Python connect 别名仍经过受保护的真实生成器链；**预先捕获的原生 C 函数引用无法靠替换模块导出撤销**。边界测试特意触达外层原生替身一次，不把它改报成项目守卫拦截。
+
+可信入口只加载经过审查的仓库测试、固定插件和受信任虚拟环境依赖。默认离线入口不需要数据库凭据，且清除应用连接环境。未来真实测试还必须具备专用低权限角色、独立实例、凭据隔离及操作系统/网络目标限制；这些尚未创建或验证。后台 worker 必须在测试许可结束前停止并归还连接；当前设施不能代替未来真实并发、提交结果不确定和网络隔离验收。
+
+### 定向修复离线记录（2026-11-27）
+
+| 检查 | 实际结果 | 退出码 |
+| --- | --- | --- |
+| F1–F8 与补充定向回归 | 60 passed | 0 |
+| 安全测试目录 | 210 passed | 0 |
+| 全部非集成测试 | 1077 passed，1 deselected | 0 |
+| 默认 pytest | 1077 passed，1 skipped | 0 |
+| pip check | No broken requirements found. | 0 |
+| git diff --check | 通过 | 0 |
+
+原有 150 项安全测试和 867 项业务测试保留，新增 60 项。首批正式复现修复前 12 failed，修复后同组 12 passed；后续还先复现并修复真实方言初始化、库内部日志和初始化失效连接路径，最终 60 项全部通过。此记录没有把旧 55 项临时探针宣称为逐字重跑后的全部通过。
+
+四组最终 pytest 均仅预装独立物理替身，未预装被测项目守卫。每组子进程汇总替身触达 4 次：3 次受控运行期正向/日志探针，1 次已保存原生引用边界探针；主进程原生替身触达 0，真实 PostgreSQL 连接 0。其余拒绝场景断言在项目守卫处阻止。安全目录及全量回归中的一次环境审计计数来自原测试直接发出 sys.audit 事件，没有打开或读取 .env；所有子进程环境审计计数为 0。默认跳过的旧 SELECT 1 不计作原生成功。
+
+真实 SELECT 1、在线迁移、PG 原生行锁/双连接并发、网络故障及提交应答丢失均未执行。初始化目录、实例启停、真实连接、建库建角色、GRANT/REVOKE、环境标识 DDL、写入/清理和故障注入仍须另行明确授权。
+
+### 第二轮审查问题定向修复（G1–G3）
+
+当前基线为 1089 项非集成回归，包括额外的 12 项注册清理测试；上表 1077 项是历史记录。
+第二轮独立审查发现 raw DBAPI、两阶段提交和 SAVEPOINT 清理缺口。本轮只修改测试安全设施与回归，不改变业务 API、认证、Schema 或前端。
+
+- G1：`Engine.connect()` 内部建立短期借出资格；直接 `Engine.raw_connection()` / `Pool.connect()` 拒绝。每次 checkout 创建新的受控 DBAPI 句柄，SQL、批量 SQL、结果读取及 commit 复查当前连接租约、运行期与熔断；归还池后的旧句柄不会随物理连接复用而恢复权限。rollback/close 保留有界清理用途。
+- G2：测试 Engine 不支持两阶段事务，SQLAlchemy 事件、方言方法和 DBAPI `tpc_*` 都禁止 begin/prepare/commit。对已登记的历史事务仅允许精确绑定的回滚；不自动接管外部 XID 或执行 recover。
+- G3：熔断后的嵌套回滚仅接受当前真实 `NestedTransaction`、当前根事务和此前核验过的 checkout。一次性清理资格绑定确切 `RollbackToSavepointClause` 及其编译 SQL；直接文本、其他名称、跨连接、批量执行和过期上下文都不能借用。回滚异常会撤销资格、作废连接并返回脱敏错误。
+
+受控方言初始化保持原有三条 `exec_driver_sql` 查询及固定隔离级别读取。核验阶段的 DBAPI 只接收实际 SQLAlchemy 执行上下文中批准的只读核验查询；未完成核验的原始 SQL/commit 不因核验上下文而获准。代理不提供任意 Psycopg 扩展方法或原生 `pgconn` 接口。
+
+专项回归可以独立执行：
+
+```powershell
+.\.venv\Scripts\python.exe -B run_pg_tests.py -q tests/postgres/test_raw_connection_guard.py tests/postgres/test_twophase_guard.py tests/postgres/test_savepoint_cleanup.py
+```
+
+正式测试不依赖审查临时目录。验证使用独立外层原生驱动替身，并区分模拟调用与真实连接。当前工作仍只适用于离线验证，必须继续独立复审；不授予 Commit、Push、PR 或真实 PostgreSQL 操作权限。
+
+本轮最终离线结果（2026-11-28）：
+
+| 检查 | 结果 | 退出码 |
+| --- | --- | --- |
+| G1–G3 专项回归 | 52 passed | 0 |
+| 安全测试目录 | 262 passed | 0 |
+| 全部非集成测试 | 1141 passed，1 deselected | 0 |
+| 默认 pytest | 1141 passed，1 skipped | 0 |
+| pip check / git diff --check | 通过 | 0 |
+
+首批 37 项修复前为 23 failed、14 passed；随后补齐边界用例，最终新增 52 项。原有 1089 项保留；仅规范化既有 `protected_405` 参数在收集时生成的随机 UUID 后，旧 1090 个节点（含 integration）缺失 0。默认 pytest 保持当前已安装插件自动加载；测试仅禁用 cache 写入，应用凭据及注入变量由外层隔离。
+
+最终专项的外层原生替身与内置物理替身均触达 0 次；安全目录、非集成及默认 pytest 各有 4 次明示的内置替身正向/边界控制，独立外层原生替身均为 0。后面三组各一次环境审计来自显式 `sys.audit` 模拟，没有打开 `.env`。真实 PostgreSQL 连接、真实数据库 SQL和在线迁移均为 0。
+
 ## 启动前端
 
 在另一个 PowerShell 终端中：
@@ -308,7 +420,7 @@ python -m pytest -q -m integration
 python -m pip check
 ```
 
-`integration` 标记的测试读取本机 `backend/.env` 并连接真实 PostgreSQL；缺少该文件时会明确跳过，不能用 Mock 结果替代。
+`integration` 已纳入统一 PostgreSQL 安全入口，默认跳过；不会读取真实 `backend/.env`。普通回归与测试收集不连接 PostgreSQL。未来需双重 opt-in、专用白名单配置和服务器身份核验，且必须另行获得数据库操作授权。安全跳过和 Mock 不能算原生验证通过。
 
 模型单元测试不依赖 `.env`，只在启用外键检查的 SQLite 内存库中验证约束，并离线编译 PostgreSQL DDL。SQLite 与 PostgreSQL 的大小写、长度和时区行为存在差异，详细边界见架构文档。仓库内的真实 PostgreSQL 集成测试仍只执行只读 `SELECT 1`；另行授权的原生迁移演练见本地验证记录。
 
